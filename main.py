@@ -160,7 +160,8 @@ async def ask_claude(chat_id: str, user_text: str) -> str:
                 data = transcript.json()
                 events = data.get("events", [])
                 status = data.get("status", "")
-                
+
+                logger.info(f"Session status: {status}, Events count: {len(events)}, Event types: {[e.get('type') for e in events]}")
                 for event in reversed(events):
                     if event.get("type") == "agent.message":
                         for block in event.get("content", []):
