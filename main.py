@@ -109,7 +109,6 @@ async def process_update(data: dict):
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 async def ask_claude(chat_id: str, user_text: str) -> str:
-    AGENT_ID = os.environ.get("AGENT_ID", "agent_01TStkKvFmCiGM7cVXtnmypB")
     SESSION_ID = os.environ.get("SESSION_ID", "sesn_01PWp9mY32e5pijw4XAt82f7")
     
     try:
@@ -132,39 +131,38 @@ async def ask_claude(chat_id: str, user_text: str) -> str:
             )
             resp.raise_for_status()
             
-            # Agent cevabını bekle
-            import asyncio
-            await asyncio.sleep(15)
-            
-            # Session transcript'ini oku
-            transcript = await client.get(
-                f"https://api.anthropic.com/v1/sessions/{SESSION_ID}/events",
+            # SSE stream'den cevabı oku
+            agent_reply = ""
+            async with client.stream(
+                "GET",
+                f"https://api.anthropic.com/v1/sessions/{SESSION_ID}/events/stream",
                 headers={
                     "x-api-key": CLAUDE_API_KEY,
                     "anthropic-version": "2023-06-01",
                     "anthropic-beta": "managed-agents-2026-04-01",
                 },
-            )
-            transcript.raise_for_status()
-            events = transcript.json().get("events", [])
+            ) as stream:
+                async for line in stream.aiter_lines():
+                    if line.startswith("data:"):
+                        try:
+                            event = json.loads(line[5:].strip())
+                            if event.get("type") == "agent.message":
+                                for block in event.get("content", []):
+                                    if block.get("type") == "text":
+                                        agent_reply += block["text"]
+                            elif event.get("type") == "session.idle":
+                                break
+                        except:
+                            continue
             
-            # Son agent mesajını bul
-            for event in reversed(events):
-                if event.get("type") == "agent.message":
-                    content = event.get("content", [])
-                    for block in content:
-                        if block.get("type") == "text":
-                            return block["text"]
-            
-            return "⚠️ Agent cevap vermedi."
+            return agent_reply or "⚠️ Agent cevap vermedi."
 
     except httpx.HTTPStatusError as e:
         logger.error(f"API hatası: {e.response.status_code} – {e.response.text}")
-        return "⚠️ API'ye ulaşılamadı."
+        return f"⚠️ API hatası: {e.response.status_code}"
     except Exception as e:
         logger.error(f"Hata: {e}")
-        return "⚠️ Bir hata oluştu."
-
+        return f"⚠️ Hata: {str(e)}"
 # ── Ses transkripsiyonu ───────────────────────────────────────────────────────
 async def transcribe_voice(file_id: str) -> str | None:
     try:
