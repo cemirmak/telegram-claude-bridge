@@ -268,7 +268,7 @@ async def webhook(request: Request, background: BackgroundTasks):
             await send_telegram(chat_id, "👋 Merhaba! REDZARRAM mağaza asistanına hoş geldiniz.")
             return JSONResponse({"ok": True})
         background.add_task(handle_message, chat_id, text)
-        await send_telegram(chat_id, "⏳ Anlıyorum, bir saniye…")
+        await send_telegram(chat_id, "⏳ Cevap Yazılıyor")
     else:
         await send_telegram(chat_id, "⚠️ Yalnızca metin veya ses gönderebilirsiniz.")
 
