@@ -131,37 +131,38 @@ async def ask_claude(chat_id: str, user_text: str) -> str:
             )
             resp.raise_for_status()
             
-            # SSE stream'den cevabı oku
+            # Agent cevabını bekle ve oku
+            import asyncio
             agent_reply = ""
-            async with client.stream(
-                "GET",
-                f"https://api.anthropic.com/v1/sessions/{SESSION_ID}/events/stream",
-                headers={
-                    "x-api-key": CLAUDE_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "anthropic-beta": "managed-agents-2026-04-01",
-                },
-                timeout=180.0,
-            ) as stream:
-                async for line in stream.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith("data:"):
-                        data_str = line[5:].strip()
-                        if not data_str or data_str == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(data_str)
-                            etype = event.get("type", "")
-                            if etype == "agent.message":
-                                for block in event.get("content", []):
-                                    if block.get("type") == "text":
-                                        agent_reply += block["text"]
-                            elif etype in ("session.idle", "session.stopped", "error"):
-                                break
-                        except json.JSONDecodeError:
-                            continue
-
+            
+            for _ in range(24):  # max 2 dakika bekle
+                await asyncio.sleep(5)
+                
+                transcript = await client.get(
+                    f"https://api.anthropic.com/v1/sessions/{SESSION_ID}/events",
+                    headers={
+                        "x-api-key": CLAUDE_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "anthropic-beta": "managed-agents-2026-04-01",
+                    },
+                )
+                transcript.raise_for_status()
+                data = transcript.json()
+                events = data.get("events", [])
+                session_status = data.get("status", "")
+                
+                # Son agent mesajını bul
+                for event in reversed(events):
+                    if event.get("type") == "agent.message":
+                        for block in event.get("content", []):
+                            if block.get("type") == "text":
+                                agent_reply = block["text"]
+                        break
+                
+                # Session idle veya stopped ise dur
+                if session_status in ("idle", "stopped") and agent_reply:
+                    break
+            
             return agent_reply or "⚠️ Agent cevap vermedi."
 
     except httpx.HTTPStatusError as e:
