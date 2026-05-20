@@ -21,37 +21,37 @@ from fastapi.responses import JSONResponse
 CLAUDE_API_KEY  = os.environ["CLAUDE_API_KEY"]
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 AGENT_ID        = os.environ["AGENT_ID"]
-SESSION_ID      = os.environ.get("SESSION_ID", "")   # opsiyonel; yoksa otomatik açılır
+SESSION_ID      = os.environ.get("SESSION_ID", "")
 ENV_ID          = os.environ["ENV_ID"]
 
 CLAUDE_BASE     = "https://api.anthropic.com"
 TELEGRAM_BASE   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# Tüm Managed Agents isteklerinde bu iki header ZORUNLU
 CLAUDE_HEADERS = {
     "x-api-key":         CLAUDE_API_KEY,
     "anthropic-version": "2023-06-01",
-    "anthropic-beta":    "managed-agents-2026-04-01",   # ← EKSİK OLAN BU'YDU
+    "anthropic-beta":    "managed-agents-2026-04-01",
     "content-type":      "application/json",
 }
 
-POLL_INTERVAL   = 2     # saniye — events ne sıklıkla kontrol edilsin
-POLL_TIMEOUT    = 120   # saniye — en fazla bu kadar bekle
-WHISPER_MODEL   = "base"  # küçük model; large için daha iyi doğruluk ama yavaş
+POLL_INTERVAL   = 2
+POLL_TIMEOUT    = 120
+WHISPER_MODEL   = "base"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+# ─── Global değişkenler ─────────────────────────────────────────────────────
+
+_active_session_id: str = SESSION_ID
+_whisper_model = None   # startup'ta yüklenir, her ses mesajında tekrar indirilmez
+
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
-_active_session_id: str = SESSION_ID  # global; restart'ta ortam değişkeninden gelir
-
 async def get_or_create_session() -> str:
-    """Mevcut session varsa kullan, yoksa yenisini aç."""
     global _active_session_id
 
     if _active_session_id:
-        # Var olan session'ın durumunu kontrol et
         async with httpx.AsyncClient() as client:
             r = await client.get(
                 f"{CLAUDE_BASE}/v1/sessions/{_active_session_id}",
@@ -66,7 +66,6 @@ async def get_or_create_session() -> str:
                 return _active_session_id
             log.warning(f"Session {_active_session_id} kullanılamaz (status={status}), yenisi açılıyor.")
 
-    # Yeni session aç
     payload = {
         "agent":       {"type": "agent", "id": AGENT_ID},
         "environment": {"type": "environment", "id": ENV_ID},
@@ -87,10 +86,8 @@ async def get_or_create_session() -> str:
 # ─── Claude'a mesaj gönder ve cevabı bekle ──────────────────────────────────
 
 async def ask_claude(user_text: str) -> str:
-    """Kullanıcı metnini agent'a gönder, cevap döndür."""
     session_id = await get_or_create_session()
 
-    # 1) Kullanıcı mesajını gönder
     send_payload = {
         "events": [
             {
@@ -112,8 +109,6 @@ async def ask_claude(user_text: str) -> str:
 
     log.info(f"Mesaj gönderildi, cevap bekleniyor… (session={session_id})")
 
-    # 2) Events endpoint'ini poll et — GET /v1/sessions/{id}/events
-    #    Bu endpoint DÜZELTİLDİ: daha önce GET /v1/sessions/{id} kullanılıyordu (yanlış)
     deadline = time.time() + POLL_TIMEOUT
     last_event_count = 0
 
@@ -122,7 +117,7 @@ async def ask_claude(user_text: str) -> str:
 
         async with httpx.AsyncClient() as client:
             r = await client.get(
-                f"{CLAUDE_BASE}/v1/sessions/{session_id}/events",   # ← DOĞRU ENDPOINT
+                f"{CLAUDE_BASE}/v1/sessions/{session_id}/events",
                 headers=CLAUDE_HEADERS,
                 timeout=15,
             )
@@ -138,18 +133,15 @@ async def ask_claude(user_text: str) -> str:
             log.info(f"Events: {len(all_events)} adet, tipler: {[e.get('type') for e in all_events]}")
             last_event_count = len(all_events)
 
-        # session.status_idle ile end_turn gelince agent tamamlamış demektir
         idle_events = [e for e in all_events if e.get("type") == "session.status_idle"]
         for ev in idle_events:
             stop = ev.get("stop_reason") or {}
             stop_type = stop.get("type") if isinstance(stop, dict) else stop
             if stop_type == "end_turn":
-                # Agent cevabını bul
                 answer = _extract_agent_message(all_events)
                 log.info(f"Agent cevabı alındı ({len(answer)} karakter)")
                 return answer
 
-        # Hata eventi varsa yakala
         errors = [e for e in all_events if e.get("type") == "session.error"]
         if errors:
             err = errors[-1]
@@ -157,13 +149,11 @@ async def ask_claude(user_text: str) -> str:
             log.error(f"Session error: {msg}")
             return f"❌ Agent hatası: {msg}"
 
-    # Zaman aşımı
     log.warning(f"Zaman aşımı ({POLL_TIMEOUT}s), {last_event_count} event vardı.")
     return "⏱ Agent zamanında cevap veremedi. Lütfen tekrar deneyin."
 
 
 def _extract_agent_message(events: list) -> str:
-    """Events listesinden son agent.message metnini çıkar."""
     agent_msgs = [e for e in events if e.get("type") == "agent.message"]
     if not agent_msgs:
         return "🤔 Agent cevap oluşturdu ama metin bulunamadı."
@@ -185,7 +175,6 @@ async def send_telegram(chat_id: int, text: str) -> None:
 
 
 async def handle_message(chat_id: int, text: str) -> None:
-    """Arka planda çalışır; Telegram'a cevabı gönderir."""
     try:
         reply = await ask_claude(text)
     except Exception as exc:
@@ -195,11 +184,13 @@ async def handle_message(chat_id: int, text: str) -> None:
 
 
 async def handle_voice(chat_id: int, file_id: str) -> None:
-    """Sesli mesajı Whisper ile metne çevirip agent'a gönderir."""
-    try:
-        import whisper  # pip install openai-whisper
+    global _whisper_model
 
-        # Telegram'dan dosyayı indir
+    if _whisper_model is None:
+        await send_telegram(chat_id, "⚠️ Whisper henüz yüklenmedi, lütfen birkaç saniye bekleyip tekrar deneyin.")
+        return
+
+    try:
         async with httpx.AsyncClient() as client:
             r = await client.get(
                 f"{TELEGRAM_BASE}/getFile", params={"file_id": file_id}, timeout=10
@@ -212,8 +203,7 @@ async def handle_voice(chat_id: int, file_id: str) -> None:
             f.write(audio_data)
             tmp_path = f.name
 
-        model = whisper.load_model(WHISPER_MODEL)
-        result = model.transcribe(tmp_path)
+        result = _whisper_model.transcribe(tmp_path)
         text = result["text"].strip()
         os.unlink(tmp_path)
 
@@ -225,8 +215,6 @@ async def handle_voice(chat_id: int, file_id: str) -> None:
         await send_telegram(chat_id, f"🎙 _Duydum:_ {text}")
         await handle_message(chat_id, text)
 
-    except ImportError:
-        await send_telegram(chat_id, "⚠️ Ses desteği şu an devre dışı (whisper kurulu değil).")
     except Exception as exc:
         log.exception("Ses işleme hatası")
         await send_telegram(chat_id, f"❌ Ses işlenemedi: {exc}")
@@ -236,12 +224,26 @@ async def handle_voice(chat_id: int, file_id: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Başlangıçta session varlığını doğrula (isteğe bağlı)
+    global _whisper_model
+
+    # Whisper modelini startup'ta yükle (bir kez indirilir, bellekte kalır)
+    try:
+        import whisper
+        log.info("Whisper modeli yükleniyor, lütfen bekleyin…")
+        _whisper_model = whisper.load_model(WHISPER_MODEL)
+        log.info("✅ Whisper modeli yüklendi")
+    except ImportError:
+        log.warning("⚠️ Whisper kurulu değil, ses desteği kapalı")
+    except Exception as exc:
+        log.error(f"Whisper yüklenemedi: {exc}")
+
+    # Session varlığını doğrula
     try:
         sid = await get_or_create_session()
         log.info(f"✅ Hazır. Aktif session: {sid}")
     except Exception as exc:
         log.error(f"Session başlatılamadı: {exc}")
+
     yield
 
 
@@ -268,7 +270,7 @@ async def webhook(request: Request, background: BackgroundTasks):
             await send_telegram(chat_id, "👋 Merhaba! REDZARRAM mağaza asistanına hoş geldiniz.")
             return JSONResponse({"ok": True})
         background.add_task(handle_message, chat_id, text)
-        await send_telegram(chat_id, "⏳ Cevap Yazılıyor")
+        await send_telegram(chat_id, "⏳ Cevap yazılıyor…")
     else:
         await send_telegram(chat_id, "⚠️ Yalnızca metin veya ses gönderebilirsiniz.")
 
@@ -277,4 +279,4 @@ async def webhook(request: Request, background: BackgroundTasks):
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "session": _active_session_id}
+    return {"status": "ok", "session": _active_session_id, "whisper": _whisper_model is not None}
