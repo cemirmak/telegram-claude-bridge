@@ -1,231 +1,280 @@
 """
-Telegram → Claude API Bridge
-Railway üzerinde çalışan webhook servisi.
+Telegram → Claude Managed Agents köprüsü
+Render.com'da çalışır (FastAPI + httpx + Whisper)
+
+Ortam değişkenleri (Render.com Environment):
+  CLAUDE_API_KEY     — Anthropic API anahtarı
+  TELEGRAM_TOKEN     — Telegram bot token (@BotFather)
+  AGENT_ID           — agent_01TStkKvFmCiGM7cVXtnmypB
+  SESSION_ID         — sesn_01PWp9mY32e5pijw4XAt82f7  (opsiyonel; yoksa yeni session açılır)
+  ENV_ID             — env_01EhVfhGqqc9yytZZE3ieaSb
 """
 
-import os
-import json
-import logging
-import tempfile
-from pathlib import Path
+import os, asyncio, json, logging, tempfile, time
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-# ── Config (Railway environment variables) ───────────────────────────────────
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+# ─── Yapılandırma ───────────────────────────────────────────────────────────
 CLAUDE_API_KEY  = os.environ["CLAUDE_API_KEY"]
-CLAUDE_MODEL    = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
-SYSTEM_PROMPT   = os.environ.get(
-    "SYSTEM_PROMPT",
-    "Sen yardımsever bir asistansın. Kullanıcıyla Türkçe konuş, sade ve net cevaplar ver."
-)
-WHISPER_LANG    = os.environ.get("WHISPER_LANG", "tr")   # ses dili
-MAX_HISTORY     = int(os.environ.get("MAX_HISTORY", "20"))
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+AGENT_ID        = os.environ["AGENT_ID"]
+SESSION_ID      = os.environ.get("SESSION_ID", "")   # opsiyonel; yoksa otomatik açılır
+ENV_ID          = os.environ["ENV_ID"]
 
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-CLAUDE_API   = "https://api.anthropic.com/v1/messages"
+CLAUDE_BASE     = "https://api.anthropic.com"
+TELEGRAM_BASE   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# ── In-memory sohbet geçmişi (chat_id → mesaj listesi) ───────────────────────
-conversations: dict[str, list[dict]] = {}
+# Tüm Managed Agents isteklerinde bu iki header ZORUNLU
+CLAUDE_HEADERS = {
+    "x-api-key":         CLAUDE_API_KEY,
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta":    "managed-agents-2026-04-01",   # ← EKSİK OLAN BU'YDU
+    "content-type":      "application/json",
+}
 
-# ── Whisper model (lazy load) ─────────────────────────────────────────────────
-_whisper_model = None
+POLL_INTERVAL   = 2     # saniye — events ne sıklıkla kontrol edilsin
+POLL_TIMEOUT    = 120   # saniye — en fazla bu kadar bekle
+WHISPER_MODEL   = "base"  # küçük model; large için daha iyi doğruluk ama yavaş
 
-def get_whisper():
-    global _whisper_model
-    if _whisper_model is None:
-        logger.info("Whisper modeli yükleniyor (ilk seferinde uzun sürebilir)…")
-        from faster_whisper import WhisperModel
-        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        logger.info("Whisper hazır.")
-    return _whisper_model
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+# ─── Session yönetimi ───────────────────────────────────────────────────────
+
+_active_session_id: str = SESSION_ID  # global; restart'ta ortam değişkeninden gelir
+
+async def get_or_create_session() -> str:
+    """Mevcut session varsa kullan, yoksa yenisini aç."""
+    global _active_session_id
+
+    if _active_session_id:
+        # Var olan session'ın durumunu kontrol et
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{CLAUDE_BASE}/v1/sessions/{_active_session_id}",
+                headers=CLAUDE_HEADERS,
+                timeout=10,
+            )
+        if r.status_code == 200:
+            data = r.json()
+            status = data.get("status", "")
+            if status not in ("archived", "terminated"):
+                log.info(f"Mevcut session kullanılıyor: {_active_session_id} (status={status})")
+                return _active_session_id
+            log.warning(f"Session {_active_session_id} kullanılamaz (status={status}), yenisi açılıyor.")
+
+    # Yeni session aç
+    payload = {
+        "agent":       {"type": "agent", "id": AGENT_ID},
+        "environment": {"type": "environment", "id": ENV_ID},
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{CLAUDE_BASE}/v1/sessions",
+            headers=CLAUDE_HEADERS,
+            json=payload,
+            timeout=30,
+        )
+    r.raise_for_status()
+    _active_session_id = r.json()["id"]
+    log.info(f"Yeni session açıldı: {_active_session_id}")
+    return _active_session_id
 
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="Telegram-Claude Bridge")
+# ─── Claude'a mesaj gönder ve cevabı bekle ──────────────────────────────────
+
+async def ask_claude(user_text: str) -> str:
+    """Kullanıcı metnini agent'a gönder, cevap döndür."""
+    session_id = await get_or_create_session()
+
+    # 1) Kullanıcı mesajını gönder
+    send_payload = {
+        "events": [
+            {
+                "type": "user.message",
+                "content": [{"type": "text", "text": user_text}],
+            }
+        ]
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{CLAUDE_BASE}/v1/sessions/{session_id}/events",
+            headers=CLAUDE_HEADERS,
+            json=send_payload,
+            timeout=30,
+        )
+    if r.status_code not in (200, 201):
+        log.error(f"Event gönderme hatası: {r.status_code} {r.text}")
+        return f"❌ Agent'a mesaj gönderilemedi: {r.status_code}"
+
+    log.info(f"Mesaj gönderildi, cevap bekleniyor… (session={session_id})")
+
+    # 2) Events endpoint'ini poll et — GET /v1/sessions/{id}/events
+    #    Bu endpoint DÜZELTİLDİ: daha önce GET /v1/sessions/{id} kullanılıyordu (yanlış)
+    deadline = time.time() + POLL_TIMEOUT
+    last_event_count = 0
+
+    while time.time() < deadline:
+        await asyncio.sleep(POLL_INTERVAL)
+
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{CLAUDE_BASE}/v1/sessions/{session_id}/events",   # ← DOĞRU ENDPOINT
+                headers=CLAUDE_HEADERS,
+                timeout=15,
+            )
+
+        if r.status_code != 200:
+            log.warning(f"Events isteği başarısız: {r.status_code} {r.text}")
+            continue
+
+        data       = r.json()
+        all_events = data.get("events", data.get("data", []))
+
+        if len(all_events) != last_event_count:
+            log.info(f"Events: {len(all_events)} adet, tipler: {[e.get('type') for e in all_events]}")
+            last_event_count = len(all_events)
+
+        # session.status_idle ile end_turn gelince agent tamamlamış demektir
+        idle_events = [e for e in all_events if e.get("type") == "session.status_idle"]
+        for ev in idle_events:
+            stop = ev.get("stop_reason") or {}
+            stop_type = stop.get("type") if isinstance(stop, dict) else stop
+            if stop_type == "end_turn":
+                # Agent cevabını bul
+                answer = _extract_agent_message(all_events)
+                log.info(f"Agent cevabı alındı ({len(answer)} karakter)")
+                return answer
+
+        # Hata eventi varsa yakala
+        errors = [e for e in all_events if e.get("type") == "session.error"]
+        if errors:
+            err = errors[-1]
+            msg = err.get("error", {}).get("message", str(err))
+            log.error(f"Session error: {msg}")
+            return f"❌ Agent hatası: {msg}"
+
+    # Zaman aşımı
+    log.warning(f"Zaman aşımı ({POLL_TIMEOUT}s), {last_event_count} event vardı.")
+    return "⏱ Agent zamanında cevap veremedi. Lütfen tekrar deneyin."
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "model": CLAUDE_MODEL}
+def _extract_agent_message(events: list) -> str:
+    """Events listesinden son agent.message metnini çıkar."""
+    agent_msgs = [e for e in events if e.get("type") == "agent.message"]
+    if not agent_msgs:
+        return "🤔 Agent cevap oluşturdu ama metin bulunamadı."
+    last = agent_msgs[-1]
+    content = last.get("content", [])
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block["text"])
+    return "\n".join(parts) if parts else str(content)
+
+
+# ─── Telegram ───────────────────────────────────────────────────────────────
+
+async def send_telegram(chat_id: int, text: str) -> None:
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    async with httpx.AsyncClient() as client:
+        await client.post(f"{TELEGRAM_BASE}/sendMessage", json=payload, timeout=10)
+
+
+async def handle_message(chat_id: int, text: str) -> None:
+    """Arka planda çalışır; Telegram'a cevabı gönderir."""
+    try:
+        reply = await ask_claude(text)
+    except Exception as exc:
+        log.exception("ask_claude hatası")
+        reply = f"❌ Beklenmedik hata: {exc}"
+    await send_telegram(chat_id, reply)
+
+
+async def handle_voice(chat_id: int, file_id: str) -> None:
+    """Sesli mesajı Whisper ile metne çevirip agent'a gönderir."""
+    try:
+        import whisper  # pip install openai-whisper
+
+        # Telegram'dan dosyayı indir
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{TELEGRAM_BASE}/getFile", params={"file_id": file_id}, timeout=10
+            )
+            file_path = r.json()["result"]["file_path"]
+            audio_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+            audio_data = (await client.get(audio_url, timeout=30)).content
+
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+            f.write(audio_data)
+            tmp_path = f.name
+
+        model = whisper.load_model(WHISPER_MODEL)
+        result = model.transcribe(tmp_path)
+        text = result["text"].strip()
+        os.unlink(tmp_path)
+
+        if not text:
+            await send_telegram(chat_id, "⚠️ Ses anlaşılamadı, lütfen tekrar deneyin.")
+            return
+
+        log.info(f"Whisper transkript: {text!r}")
+        await send_telegram(chat_id, f"🎙 _Duydum:_ {text}")
+        await handle_message(chat_id, text)
+
+    except ImportError:
+        await send_telegram(chat_id, "⚠️ Ses desteği şu an devre dışı (whisper kurulu değil).")
+    except Exception as exc:
+        log.exception("Ses işleme hatası")
+        await send_telegram(chat_id, f"❌ Ses işlenemedi: {exc}")
+
+
+# ─── FastAPI ─────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Başlangıçta session varlığını doğrula (isteğe bağlı)
+    try:
+        sid = await get_or_create_session()
+        log.info(f"✅ Hazır. Aktif session: {sid}")
+    except Exception as exc:
+        log.error(f"Session başlatılamadı: {exc}")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks):
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+async def webhook(request: Request, background: BackgroundTasks):
+    body = await request.json()
+    msg  = body.get("message", {})
 
-    background_tasks.add_task(process_update, data)
+    chat_id = msg.get("chat", {}).get("id")
+    if not chat_id:
+        return JSONResponse({"ok": True})
+
+    text  = msg.get("text", "").strip()
+    voice = msg.get("voice") or msg.get("audio")
+
+    if voice:
+        background.add_task(handle_voice, chat_id, voice["file_id"])
+        await send_telegram(chat_id, "🎙 Ses mesajı alındı, işleniyor…")
+    elif text:
+        if text.startswith("/start"):
+            await send_telegram(chat_id, "👋 Merhaba! REDZARRAM mağaza asistanına hoş geldiniz.")
+            return JSONResponse({"ok": True})
+        background.add_task(handle_message, chat_id, text)
+        await send_telegram(chat_id, "⏳ Anlıyorum, bir saniye…")
+    else:
+        await send_telegram(chat_id, "⚠️ Yalnızca metin veya ses gönderebilirsiniz.")
+
     return JSONResponse({"ok": True})
 
 
-# ── Update işleyici ───────────────────────────────────────────────────────────
-async def process_update(data: dict):
-    message = data.get("message") or data.get("edited_message")
-    if not message:
-        return
-
-    chat_id  = str(message["chat"]["id"])
-    username = message.get("from", {}).get("username", "?")
-    logger.info(f"Mesaj geldi | chat={chat_id} user=@{username}")
-
-    # /reset komutu → geçmişi sil
-    if message.get("text", "").strip().lower() in ("/reset", "/start"):
-        conversations.pop(chat_id, None)
-        await send_message(chat_id, "🔄 Sohbet sıfırlandı. Merhaba!")
-        return
-
-    # Ses → metin
-    if "voice" in message:
-        await send_typing(chat_id)
-        text = await transcribe_voice(message["voice"]["file_id"])
-        if not text:
-            await send_message(chat_id, "⚠️ Ses mesajı çözümlenemedi, lütfen tekrar deneyin.")
-            return
-        logger.info(f"Transkript: {text[:80]}")
-        await send_message(chat_id, f"🎙️ _{text}_\n\nİşleniyor…")
-
-    elif "text" in message:
-        text = message["text"].strip()
-    else:
-        await send_message(chat_id, "Bu mesaj türü desteklenmiyor. Lütfen metin veya ses gönderin.")
-        return
-
-    await send_typing(chat_id)
-    reply = await ask_claude(chat_id, text)
-    await send_message(chat_id, reply)
-
-
-# ── Claude ────────────────────────────────────────────────────────────────────
-async def ask_claude(chat_id: str, user_text: str) -> str:
-    AGENT_ID = os.environ.get("AGENT_ID", "agent_01TStkKvFmCiGM7cVXtnmypB")
-    ENV_ID = os.environ.get("ENV_ID", "env__E31eaSb")
-    
-    import asyncio
-    
-    try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            headers = {
-                "x-api-key": CLAUDE_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "anthropic-beta": "managed-agents-2026-04-01",
-                "content-type": "application/json",
-            }
-            
-            # Yeni session oluştur
-            resp = await client.post(
-                "https://api.anthropic.com/v1/sessions",
-                headers=headers,
-                json={
-                    "agent": AGENT_ID,
-                    "environment_id": ENV_ID,
-                },
-            )
-            resp.raise_for_status()
-            session_id = resp.json()["id"]
-            
-            # Mesaj gönder
-            await client.post(
-                f"https://api.anthropic.com/v1/sessions/{session_id}/events",
-                headers=headers,
-                json={
-                    "events": [{
-                        "type": "user.message",
-                        "content": [{"type": "text", "text": user_text}]
-                    }]
-                },
-            )
-            
-            # Cevabı bekle
-            agent_reply = ""
-            for _ in range(36):  # max 3 dakika
-                await asyncio.sleep(5)
-                
-                transcript = await client.get(
-                    f"https://api.anthropic.com/v1/sessions/{session_id}",
-                    headers=headers,
-                )
-                transcript.raise_for_status()
-                data = transcript.json()
-                events = data.get("events", [])
-                status = data.get("status", "")
-
-                logger.info(f"Session status: {status}, Events count: {len(events)}, Event types: {[e.get('type') for e in events]}")
-                for event in reversed(events):
-                    if event.get("type") == "agent.message":
-                        for block in event.get("content", []):
-                            if block.get("type") == "text":
-                                agent_reply = block["text"]
-                        break
-                
-                if agent_reply:
-                    break
-            
-            return agent_reply or "⚠️ Agent cevap vermedi."
-
-    except httpx.HTTPStatusError as e:
-        logger.error(f"API hatası: {e.response.status_code} – {e.response.text}")
-        return f"⚠️ API hatası: {e.response.status_code}"
-    except Exception as e:
-        logger.error(f"Hata: {e}")
-        return f"⚠️ Hata: {str(e)}"
-# ── Ses transkripsiyonu ───────────────────────────────────────────────────────
-async def transcribe_voice(file_id: str) -> str | None:
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # Telegram'dan dosya yolunu al
-            file_info = await client.get(f"{TELEGRAM_API}/getFile?file_id={file_id}")
-            file_path = file_info.json()["result"]["file_path"]
-
-            # Ses dosyasını indir
-            audio = await client.get(
-                f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
-            )
-
-        # Geçici dosyaya yaz
-        suffix = "." + file_path.split(".")[-1]  # .ogg veya .oga
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-            f.write(audio.content)
-            tmp = f.name
-
-        # Whisper ile transkript
-        model = get_whisper()
-        segments, info = model.transcribe(tmp, language=WHISPER_LANG)
-        text = " ".join(seg.text.strip() for seg in segments)
-        Path(tmp).unlink(missing_ok=True)
-        return text.strip() or None
-
-    except Exception as e:
-        logger.error(f"Transkripsiyon hatası: {e}")
-        return None
-
-
-# ── Telegram yardımcıları ─────────────────────────────────────────────────────
-async def send_message(chat_id: str, text: str):
-    """Markdown destekli mesaj gönder; hata olursa düz metin dene."""
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
-        if r.status_code != 200:
-            # Markdown parse hatası olabilir; düz metin ile tekrar dene
-            payload.pop("parse_mode")
-            await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
-
-
-async def send_typing(chat_id: str):
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        await client.post(
-            f"{TELEGRAM_API}/sendChatAction",
-            json={"chat_id": chat_id, "action": "typing"},
-        )
+@app.get("/")
+async def health():
+    return {"status": "ok", "session": _active_session_id}
