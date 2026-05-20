@@ -153,7 +153,7 @@ async def ask_claude(chat_id: str, user_text: str) -> str:
                 await asyncio.sleep(5)
                 
                 transcript = await client.get(
-                    f"https://api.anthropic.com/v1/sessions/{session_id}/events",
+                    f"https://api.anthropic.com/v1/sessions/{session_id}",
                     headers=headers,
                 )
                 transcript.raise_for_status()
