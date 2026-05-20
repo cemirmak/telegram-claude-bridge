@@ -109,19 +109,36 @@ async def process_update(data: dict):
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 async def ask_claude(chat_id: str, user_text: str) -> str:
-    SESSION_ID = os.environ.get("SESSION_ID", "sesn_01PWp9mY32e5pijw4XAt82f7")
+    AGENT_ID = os.environ.get("AGENT_ID", "agent_01TStkKvFmCiGM7cVXtnmypB")
+    ENV_ID = os.environ.get("ENV_ID", "env__E31eaSb")
+    
+    import asyncio
     
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            # Session'a mesaj gönder
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            headers = {
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "managed-agents-2026-04-01",
+                "content-type": "application/json",
+            }
+            
+            # Yeni session oluştur
             resp = await client.post(
-                f"https://api.anthropic.com/v1/sessions/{SESSION_ID}/events",
-                headers={
-                    "x-api-key": CLAUDE_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "anthropic-beta": "managed-agents-2026-04-01",
-                    "content-type": "application/json",
+                "https://api.anthropic.com/v1/sessions",
+                headers=headers,
+                json={
+                    "agent_id": AGENT_ID,
+                    "environment_id": ENV_ID,
                 },
+            )
+            resp.raise_for_status()
+            session_id = resp.json()["id"]
+            
+            # Mesaj gönder
+            await client.post(
+                f"https://api.anthropic.com/v1/sessions/{session_id}/events",
+                headers=headers,
                 json={
                     "events": [{
                         "type": "user.message",
@@ -129,29 +146,21 @@ async def ask_claude(chat_id: str, user_text: str) -> str:
                     }]
                 },
             )
-            resp.raise_for_status()
             
-            # Agent cevabını bekle ve oku
-            import asyncio
+            # Cevabı bekle
             agent_reply = ""
-            
-            for _ in range(24):  # max 2 dakika bekle
+            for _ in range(36):  # max 3 dakika
                 await asyncio.sleep(5)
                 
                 transcript = await client.get(
-                    f"https://api.anthropic.com/v1/sessions/{SESSION_ID}/events",
-                    headers={
-                        "x-api-key": CLAUDE_API_KEY,
-                        "anthropic-version": "2023-06-01",
-                        "anthropic-beta": "managed-agents-2026-04-01",
-                    },
+                    f"https://api.anthropic.com/v1/sessions/{session_id}/events",
+                    headers=headers,
                 )
                 transcript.raise_for_status()
                 data = transcript.json()
                 events = data.get("events", [])
-                session_status = data.get("status", "")
+                status = data.get("status", "")
                 
-                # Son agent mesajını bul
                 for event in reversed(events):
                     if event.get("type") == "agent.message":
                         for block in event.get("content", []):
@@ -159,7 +168,6 @@ async def ask_claude(chat_id: str, user_text: str) -> str:
                                 agent_reply = block["text"]
                         break
                 
-                # Cevap geldiyse dur
                 if agent_reply:
                     break
             
