@@ -141,20 +141,27 @@ async def ask_claude(chat_id: str, user_text: str) -> str:
                     "anthropic-version": "2023-06-01",
                     "anthropic-beta": "managed-agents-2026-04-01",
                 },
+                timeout=180.0,
             ) as stream:
                 async for line in stream.aiter_lines():
+                    if not line:
+                        continue
                     if line.startswith("data:"):
+                        data_str = line[5:].strip()
+                        if not data_str or data_str == "[DONE]":
+                            break
                         try:
-                            event = json.loads(line[5:].strip())
-                            if event.get("type") == "agent.message":
+                            event = json.loads(data_str)
+                            etype = event.get("type", "")
+                            if etype == "agent.message":
                                 for block in event.get("content", []):
                                     if block.get("type") == "text":
                                         agent_reply += block["text"]
-                            elif event.get("type") == "session.idle":
+                            elif etype in ("session.idle", "session.stopped", "error"):
                                 break
-                        except:
+                        except json.JSONDecodeError:
                             continue
-            
+
             return agent_reply or "⚠️ Agent cevap vermedi."
 
     except httpx.HTTPStatusError as e:
