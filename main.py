@@ -159,8 +159,8 @@ async def ask_claude(chat_id: str, user_text: str) -> str:
                                 agent_reply = block["text"]
                         break
                 
-                # Session idle veya stopped ise dur
-                if session_status in ("idle", "stopped") and agent_reply:
+                # Cevap geldiyse dur
+                if agent_reply:
                     break
             
             return agent_reply or "⚠️ Agent cevap vermedi."
