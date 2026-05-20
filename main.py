@@ -109,43 +109,61 @@ async def process_update(data: dict):
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 async def ask_claude(chat_id: str, user_text: str) -> str:
-    history = conversations.setdefault(chat_id, [])
-    history.append({"role": "user", "content": user_text})
-
-    # Bağlam penceresini sınırla
-    if len(history) > MAX_HISTORY:
-        conversations[chat_id] = history[-MAX_HISTORY:]
-
+    AGENT_ID = os.environ.get("AGENT_ID", "agent_01TStkKvFmCiGM7cVXtnmypB")
+    SESSION_ID = os.environ.get("SESSION_ID", "sesn_01PWp9mY32e5pijw4XAt82f7")
+    
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            # Session'a mesaj gönder
             resp = await client.post(
-                CLAUDE_API,
+                f"https://api.anthropic.com/v1/sessions/{SESSION_ID}/events",
                 headers={
                     "x-api-key": CLAUDE_API_KEY,
                     "anthropic-version": "2023-06-01",
+                    "anthropic-beta": "managed-agents-2026-04-01",
                     "content-type": "application/json",
                 },
                 json={
-                    "model": CLAUDE_MODEL,
-                    "max_tokens": 1024,
-                    "system": SYSTEM_PROMPT,
-                    "messages": conversations[chat_id],
+                    "events": [{
+                        "type": "user.message",
+                        "content": [{"type": "text", "text": user_text}]
+                    }]
                 },
             )
             resp.raise_for_status()
-            data = resp.json()
-            reply = data["content"][0]["text"]
+            
+            # Agent cevabını bekle
+            import asyncio
+            await asyncio.sleep(15)
+            
+            # Session transcript'ini oku
+            transcript = await client.get(
+                f"https://api.anthropic.com/v1/sessions/{SESSION_ID}/events",
+                headers={
+                    "x-api-key": CLAUDE_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "anthropic-beta": "managed-agents-2026-04-01",
+                },
+            )
+            transcript.raise_for_status()
+            events = transcript.json().get("events", [])
+            
+            # Son agent mesajını bul
+            for event in reversed(events):
+                if event.get("type") == "agent.message":
+                    content = event.get("content", [])
+                    for block in content:
+                        if block.get("type") == "text":
+                            return block["text"]
+            
+            return "⚠️ Agent cevap vermedi."
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"Claude API hatası: {e.response.status_code} – {e.response.text}")
-        return "⚠️ Claude API'ye ulaşılamadı. Lütfen tekrar deneyin."
+        logger.error(f"API hatası: {e.response.status_code} – {e.response.text}")
+        return "⚠️ API'ye ulaşılamadı."
     except Exception as e:
-        logger.error(f"Beklenmeyen hata: {e}")
-        return "⚠️ Bir hata oluştu. Lütfen tekrar deneyin."
-
-    conversations[chat_id].append({"role": "assistant", "content": reply})
-    return reply
-
+        logger.error(f"Hata: {e}")
+        return "⚠️ Bir hata oluştu."
 
 # ── Ses transkripsiyonu ───────────────────────────────────────────────────────
 async def transcribe_voice(file_id: str) -> str | None:
