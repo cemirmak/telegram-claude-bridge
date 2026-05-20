@@ -128,7 +128,7 @@ async def ask_claude(chat_id: str, user_text: str) -> str:
                 "https://api.anthropic.com/v1/sessions",
                 headers=headers,
                 json={
-                    "agent_id": AGENT_ID,
+                    "agent": AGENT_ID,
                     "environment_id": ENV_ID,
                 },
             )
