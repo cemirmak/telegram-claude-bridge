@@ -3,10 +3,10 @@ Telegram → Claude Managed Agents köprüsü
 Render.com'da çalışır (FastAPI + httpx + APScheduler)
 
 Zamanlama (TR saati):
-  Her 5 dakika         → Trendyol yeni sipariş kontrolü + tedarikçi bildirimi
-  10:00, 14:00, 20:00  → Carousel post (Instagram + Facebook)
-  20:30                → Reels (sadece Instagram)
-  00:00                → Story (Instagram + Facebook)
+  Her 5 dakika              → Trendyol yeni sipariş kontrolü + tedarikçi bildirimi
+  09:00, 12:00, 16:00, 21:00 → Carousel post (Instagram + Facebook)
+  10:30, 19:00              → Reels (sadece Instagram)
+  14:00, 23:00              → Story (Instagram + Facebook)
 """
 
 import os, asyncio, logging, time, base64, json, re, io
@@ -41,9 +41,15 @@ TRENDYOL_SUPPLIER_ID = os.environ.get("TRENDYOL_SUPPLIER_ID", "1075171")
 
 # Tedarikçi Telegram chat ID'leri
 SUPPLIER_CHAT_IDS = {
-    "Yusuf Cem":  int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
-    "Cem Irmak":  int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    "Yusuf Cem":      int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    "Cem Irmak":      int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    "VOLKAN KARASU":  int(os.environ.get("VOLKAN_CHAT_ID", "7031711634")),
+    "Volkan Karasu":  int(os.environ.get("VOLKAN_CHAT_ID", "7031711634")),
+    "Özer Denim":     int(os.environ.get("OZER_CHAT_ID", "6868801554")),
 }
+
+# Tedarikçi bazlı kısıtlama — sadece kendi ürünlerini görecekler
+RESTRICTED_SUPPLIERS = {"Özer Denim"}
 
 CLAUDE_BASE   = "https://api.anthropic.com"
 TELEGRAM_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -66,18 +72,25 @@ SUPPLIER_JSON = "tedarikci-eslesme.json"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-_active_session_id: str   = SESSION_ID
-_posted_today: set         = set()
-_posted_date: str          = ""
-_notified_orders: set      = set()
-SUPPLIER_DATA: list        = []
-BARCODE_SUPPLIER_MAP: dict = {}
-BARCODE_IMAGE_MAP: dict    = {}  # barkod → görsel URL
+_active_session_id: str    = SESSION_ID
+_posted_today: set          = set()
+_posted_date: str           = ""
+_notified_orders: set       = set()
+SUPPLIER_DATA: list         = []
+BARCODE_SUPPLIER_MAP: dict  = {}
+BARCODE_IMAGE_MAP: dict     = {}
+CHAT_SUPPLIER_MAP: dict     = {}  # chat_id → tedarikçi adı (kısıtlı erişim için)
 
 # ─── Tedarikçi ve görsel verisi ──────────────────────────────────────────────
 
 def load_supplier_data():
-    global SUPPLIER_DATA, BARCODE_SUPPLIER_MAP, BARCODE_IMAGE_MAP
+    global SUPPLIER_DATA, BARCODE_SUPPLIER_MAP, BARCODE_IMAGE_MAP, CHAT_SUPPLIER_MAP
+
+    # chat_id → tedarikçi adı haritası (ters çevirme)
+    for name, chat_id in SUPPLIER_CHAT_IDS.items():
+        if name in RESTRICTED_SUPPLIERS:
+            CHAT_SUPPLIER_MAP[chat_id] = name
+
     try:
         with open(SUPPLIER_JSON, "r", encoding="utf-8") as f:
             SUPPLIER_DATA = json.load(f)
@@ -102,7 +115,6 @@ def load_supplier_data():
                 BARCODE_SUPPLIER_MAP[sz_barkod] = tedarikci
                 count += 1
 
-            # Görsel URL'sini kaydet (Görsel 1)
             gorsel = str(row.get("Görsel 1", "")).strip()
             if sz_barkod and gorsel.startswith("http"):
                 BARCODE_IMAGE_MAP[sz_barkod] = gorsel
@@ -118,6 +130,11 @@ def match_supplier(barcode: str) -> str:
 
 def get_product_image(barcode: str) -> str:
     return BARCODE_IMAGE_MAP.get(str(barcode).strip(), "")
+
+
+def get_supplier_for_chat(chat_id: int) -> str:
+    """Kısıtlı tedarikçi mi? Evet ise adını döndür, hayır ise boş."""
+    return CHAT_SUPPLIER_MAP.get(chat_id, "")
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
@@ -222,7 +239,7 @@ def get_trendyol_headers() -> dict:
     }
 
 
-async def fetch_orders(days: int = 1) -> list:
+async def fetch_orders(days: int = 1, supplier_filter: str = "") -> list:
     end_ms   = int(datetime.now().timestamp() * 1000)
     start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
     url      = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
@@ -243,7 +260,23 @@ async def fetch_orders(days: int = 1) -> list:
             data        = r.json()
             content     = data.get("content", [])
             total_pages = data.get("totalPages", 1)
-            all_orders.extend(content)
+
+            # Tedarikçi filtresi
+            if supplier_filter:
+                filtered = []
+                for order in content:
+                    filtered_lines = [
+                        line for line in order.get("lines", [])
+                        if match_supplier(line.get("barcode", "")) == supplier_filter
+                    ]
+                    if filtered_lines:
+                        order_copy = dict(order)
+                        order_copy["lines"] = filtered_lines
+                        filtered.append(order_copy)
+                all_orders.extend(filtered)
+            else:
+                all_orders.extend(content)
+
             if page >= total_pages - 1 or not content:
                 break
             page += 1
@@ -274,6 +307,192 @@ async def fetch_new_orders() -> list:
         log.error(f"Trendyol fetch hatası: {e}")
         return []
 
+# ─── Kâr hesabı ─────────────────────────────────────────────────────────────
+
+def calculate_profit(total_amount: float, total_orders: int, total_qty: int) -> dict:
+    """
+    Hesaplama:
+    1. Brüt Kâr = Toplam Satış - Komisyon(%21.5) - Kargo(60₺ × sipariş)
+    2. Maliyet Sonrası = Brüt Kâr × %45  (maliyet %55 olarak düşülür, gösterilmez)
+    3. KDV = Maliyet Sonrası × %10
+    4. Net Kâr = Maliyet Sonrası - KDV
+    """
+    komisyon   = total_amount * 0.215
+    kargo      = total_orders * 60
+    brut_kar   = total_amount - komisyon - kargo
+    ms_kar     = brut_kar * 0.45   # maliyet sonrası (%55 maliyet düşüldü)
+    kdv        = ms_kar * 0.10
+    net_kar    = ms_kar - kdv
+
+    return {
+        "komisyon": komisyon,
+        "kargo":    kargo,
+        "kdv":      kdv,
+        "net_kar":  net_kar,
+    }
+
+# ─── Rapor oluşturma ─────────────────────────────────────────────────────────
+
+def summarize_orders(orders: list, days: int, supplier_filter: str = "") -> str:
+    if not orders:
+        prefix = f"*{supplier_filter}* için " if supplier_filter else ""
+        return f"Son {days} günde {prefix}hiç sipariş bulunamadı."
+
+    total_amount   = 0.0
+    total_qty      = 0
+    total_orders   = len(orders)
+    supplier_stats: dict = {}
+    product_stats: dict  = {}
+    cancelled = 0
+    returned  = 0
+
+    for order in orders:
+        status = order.get("status", "")
+        if status == "Cancelled":
+            cancelled += 1
+        if status in ("Returned", "UnDelivered"):
+            returned += 1
+
+        for line in order.get("lines", []):
+            qty    = line.get("quantity", 1)
+            amount = line.get("lineGrossAmount", line.get("amount", 0))
+            name   = line.get("productName", "")
+            barkod = line.get("barcode", "")
+
+            total_amount += amount
+            total_qty    += qty
+
+            supplier = match_supplier(barkod) or "Diğer"
+            if supplier not in supplier_stats:
+                supplier_stats[supplier] = {"qty": 0, "amount": 0.0}
+            supplier_stats[supplier]["qty"]    += qty
+            supplier_stats[supplier]["amount"] += amount
+
+            if name not in product_stats:
+                product_stats[name] = {"qty": 0, "amount": 0.0}
+            product_stats[name]["qty"]    += qty
+            product_stats[name]["amount"] += amount
+
+    profit = calculate_profit(total_amount, total_orders, total_qty)
+
+    supplier_lines = []
+    for sup, stats in sorted(supplier_stats.items(), key=lambda x: x[1]["amount"], reverse=True):
+        pay = (stats["amount"] / total_amount * 100) if total_amount else 0
+        supplier_lines.append(f"  • {sup}: {stats['qty']} adet | {stats['amount']:.2f}₺ (%{pay:.0f})")
+
+    top5 = sorted(product_stats.items(), key=lambda x: x[1]["qty"], reverse=True)[:5]
+    top5_lines = [f"  {i+1}. {name[:45]} → {s['qty']} adet | {s['amount']:.2f}₺"
+                  for i, (name, s) in enumerate(top5)]
+
+    title = f"Son {days} Günlük Sipariş Özeti"
+    if supplier_filter:
+        title += f" — {supplier_filter}"
+
+    supplier_section = ""
+    if not supplier_filter:
+        supplier_section = f"\n👥 *Tedarikçi Bazlı*\n{chr(10).join(supplier_lines)}\n"
+
+    return f"""📊 *{title}*
+_{datetime.now().strftime('%d.%m.%Y %H:%M')}_
+
+💰 *Finansal*
+• Toplam Sipariş: {total_orders} paket
+• Toplam Satış: {total_amount:.2f}₺
+• Trendyol Komisyonu (%21.5): -{profit['komisyon']:.2f}₺
+• Kargo Gideri (60₺/sipariş): -{profit['kargo']:.2f}₺
+• KDV: -{profit['kdv']:.2f}₺
+• Net Kâr: {profit['net_kar']:.2f}₺
+• İade/İptal: {returned + cancelled} adet
+{supplier_section}
+🏆 *En Çok Satan 5 Ürün*
+{chr(10).join(top5_lines)}
+
+_✅ Gerçek Trendyol verisi_"""
+
+
+def build_excel(orders: list, days: int, supplier_filter: str = "") -> bytes:
+    rows = []
+    for order in orders:
+        order_no   = order.get("orderNumber", "")
+        order_date = datetime.fromtimestamp(
+            order.get("orderDate", 0) / 1000
+        ).strftime("%d.%m.%Y %H:%M") if order.get("orderDate") else ""
+        status = order.get("status", "")
+
+        for line in order.get("lines", []):
+            barcode  = line.get("barcode", "")
+            supplier = match_supplier(barcode) or "Diğer"
+            rows.append({
+                "Sipariş No":  order_no,
+                "Tarih":       order_date,
+                "Durum":       status,
+                "Ürün Adı":    line.get("productName", ""),
+                "Beden":       line.get("productSize", ""),
+                "Adet":        line.get("quantity", 1),
+                "Tutar (₺)":   round(line.get("lineGrossAmount", line.get("amount", 0)), 2),
+                "Barkod":      barcode,
+                "Tedarikçi":   supplier,
+            })
+
+    df_orders = pd.DataFrame(rows)
+    supplier_summary = pd.DataFrame()
+    product_summary  = pd.DataFrame()
+
+    if not df_orders.empty:
+        if not supplier_filter:
+            supplier_summary = df_orders.groupby("Tedarikçi").agg(
+                Sipariş_Adedi=("Sipariş No", "nunique"),
+                Toplam_Adet=("Adet", "sum"),
+                Toplam_Tutar=("Tutar (₺)", "sum"),
+            ).reset_index()
+
+        product_summary = df_orders.groupby("Ürün Adı").agg(
+            Toplam_Adet=("Adet", "sum"),
+            Toplam_Tutar=("Tutar (₺)", "sum"),
+        ).sort_values("Toplam_Adet", ascending=False).reset_index()
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_orders.to_excel(writer, sheet_name="Tüm Siparişler", index=False)
+        if not supplier_summary.empty:
+            supplier_summary.to_excel(writer, sheet_name="Tedarikçi Bazlı", index=False)
+        if not product_summary.empty:
+            product_summary.to_excel(writer, sheet_name="Ürün Bazlı", index=False)
+
+        for sheet in writer.sheets.values():
+            for col in sheet.columns:
+                max_len = max(
+                    (len(str(cell.value)) if cell.value is not None else 0 for cell in col),
+                    default=10,
+                )
+                sheet.column_dimensions[col[0].column_letter].width = min(max_len + 3, 60)
+
+    return buf.getvalue()
+
+
+def extract_days(text: str) -> int:
+    text = text.lower()
+    if "bugün" in text or "bugünkü" in text:
+        return 1
+    if "bu hafta" in text or "haftalık" in text:
+        return 7
+    if "bu ay" in text or "aylık" in text:
+        return 30
+    match = re.search(r"(\d+)\s*gün", text)
+    if match:
+        return min(int(match.group(1)), 30)
+    return 3
+
+
+def is_order_report_request(text: str) -> bool:
+    keywords = ["sipariş", "satış", "rapor", "özet", "kazanç", "kâr", "gelir", "ciro", "kaç sipariş", "kaç satış"]
+    return any(kw in text.lower() for kw in keywords)
+
+
+def is_excel_request(text: str) -> bool:
+    keywords = ["excel", "xlsx", "dosya", "indir", "tablo"]
+    return any(kw in text.lower() for kw in keywords) and is_order_report_request(text)
+
 # ─── Telegram mesaj gönderme ─────────────────────────────────────────────────
 
 async def send_telegram_to(chat_id: int, text: str) -> None:
@@ -288,17 +507,11 @@ async def send_telegram_to(chat_id: int, text: str) -> None:
 
 
 async def send_photo_to_telegram(chat_id: int, photo_url: str, caption: str) -> bool:
-    """Fotoğrafı URL üzerinden Telegram'a gönderir."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 f"{TELEGRAM_BASE}/sendPhoto",
-                json={
-                    "chat_id": chat_id,
-                    "photo":   photo_url,
-                    "caption": caption,
-                    "parse_mode": "Markdown",
-                },
+                json={"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "Markdown"},
             )
         return r.status_code == 200
     except Exception as e:
@@ -357,12 +570,10 @@ async def check_new_orders():
 
 Lütfen hazırlayınız ✅"""
 
-            # Önce görsel gönder
             image_url = get_product_image(barcode)
             if image_url:
                 sent = await send_photo_to_telegram(chat_id, image_url, caption)
                 if not sent:
-                    # Görsel gönderilemezse sadece metin gönder
                     await send_telegram_to(chat_id, caption)
             else:
                 await send_telegram_to(chat_id, caption)
@@ -372,159 +583,6 @@ Lütfen hazırlayınız ✅"""
         _notified_orders.add(order_id)
         if len(_notified_orders) > 1000:
             _notified_orders = set(list(_notified_orders)[-500:])
-
-# ─── Excel oluşturma ─────────────────────────────────────────────────────────
-
-def build_excel(orders: list, days: int) -> bytes:
-    rows = []
-    for order in orders:
-        order_no   = order.get("orderNumber", "")
-        order_date = datetime.fromtimestamp(
-            order.get("orderDate", 0) / 1000
-        ).strftime("%d.%m.%Y %H:%M") if order.get("orderDate") else ""
-        status = order.get("status", "")
-
-        for line in order.get("lines", []):
-            barcode  = line.get("barcode", "")
-            supplier = match_supplier(barcode) or "Diğer"
-            rows.append({
-                "Sipariş No":  order_no,
-                "Tarih":       order_date,
-                "Durum":       status,
-                "Ürün Adı":    line.get("productName", ""),
-                "Beden":       line.get("productSize", ""),
-                "Adet":        line.get("quantity", 1),
-                "Tutar (₺)":   round(line.get("lineGrossAmount", line.get("amount", 0)), 2),
-                "Barkod":      barcode,
-                "Tedarikçi":   supplier,
-            })
-
-    df_orders = pd.DataFrame(rows)
-    supplier_summary = pd.DataFrame()
-    product_summary  = pd.DataFrame()
-
-    if not df_orders.empty:
-        supplier_summary = df_orders.groupby("Tedarikçi").agg(
-            Sipariş_Adedi=("Sipariş No", "nunique"),
-            Toplam_Adet=("Adet", "sum"),
-            Toplam_Tutar=("Tutar (₺)", "sum"),
-        ).reset_index()
-
-        product_summary = df_orders.groupby("Ürün Adı").agg(
-            Toplam_Adet=("Adet", "sum"),
-            Toplam_Tutar=("Tutar (₺)", "sum"),
-        ).sort_values("Toplam_Adet", ascending=False).reset_index()
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_orders.to_excel(writer, sheet_name="Tüm Siparişler", index=False)
-        if not supplier_summary.empty:
-            supplier_summary.to_excel(writer, sheet_name="Tedarikçi Bazlı", index=False)
-        if not product_summary.empty:
-            product_summary.to_excel(writer, sheet_name="Ürün Bazlı", index=False)
-
-        for sheet in writer.sheets.values():
-            for col in sheet.columns:
-                max_len = max(
-                    (len(str(cell.value)) if cell.value is not None else 0 for cell in col),
-                    default=10,
-                )
-                sheet.column_dimensions[col[0].column_letter].width = min(max_len + 3, 60)
-
-    return buf.getvalue()
-
-
-def summarize_orders(orders: list, days: int) -> str:
-    if not orders:
-        return f"Son {days} günde hiç sipariş bulunamadı."
-
-    total_amount   = 0.0
-    total_qty      = 0
-    supplier_stats: dict = {}
-    product_stats: dict  = {}
-    cancelled = 0
-    returned  = 0
-
-    for order in orders:
-        status = order.get("status", "")
-        if status == "Cancelled":
-            cancelled += 1
-        if status in ("Returned", "UnDelivered"):
-            returned += 1
-
-        for line in order.get("lines", []):
-            qty    = line.get("quantity", 1)
-            amount = line.get("lineGrossAmount", line.get("amount", 0))
-            name   = line.get("productName", "")
-            barkod = line.get("barcode", "")
-
-            total_amount += amount
-            total_qty    += qty
-
-            supplier = match_supplier(barkod) or "Diğer"
-            if supplier not in supplier_stats:
-                supplier_stats[supplier] = {"qty": 0, "amount": 0.0}
-            supplier_stats[supplier]["qty"]    += qty
-            supplier_stats[supplier]["amount"] += amount
-
-            if name not in product_stats:
-                product_stats[name] = {"qty": 0, "amount": 0.0}
-            product_stats[name]["qty"]    += qty
-            product_stats[name]["amount"] += amount
-
-    supplier_lines = []
-    for sup, stats in sorted(supplier_stats.items(), key=lambda x: x[1]["amount"], reverse=True):
-        pay = (stats["amount"] / total_amount * 100) if total_amount else 0
-        supplier_lines.append(f"  • {sup}: {stats['qty']} adet | {stats['amount']:.2f}₺ (%{pay:.0f})")
-
-    top5 = sorted(product_stats.items(), key=lambda x: x[1]["qty"], reverse=True)[:5]
-    top5_lines = [f"  {i+1}. {name[:45]} → {s['qty']} adet | {s['amount']:.2f}₺"
-                  for i, (name, s) in enumerate(top5)]
-
-    komisyon = total_amount * 0.215
-    net_kar  = total_amount - komisyon - (total_qty * 27.5)
-
-    return f"""📊 *Son {days} Günlük Sipariş Özeti*
-_{datetime.now().strftime('%d.%m.%Y %H:%M')}_
-
-💰 *Finansal*
-• Toplam Sipariş: {len(orders)} paket
-• Toplam Satış: {total_amount:.2f}₺
-• Trendyol Komisyonu (%21.5): -{komisyon:.2f}₺
-• Tahmini Net Kâr: {net_kar:.2f}₺
-• İade/İptal: {returned + cancelled} adet
-
-👥 *Tedarikçi Bazlı*
-{chr(10).join(supplier_lines)}
-
-🏆 *En Çok Satan 5 Ürün*
-{chr(10).join(top5_lines)}
-
-_✅ Gerçek Trendyol verisi_"""
-
-
-def extract_days(text: str) -> int:
-    text = text.lower()
-    if "bugün" in text or "bugünkü" in text:
-        return 1
-    if "bu hafta" in text or "haftalık" in text:
-        return 7
-    if "bu ay" in text or "aylık" in text:
-        return 30
-    match = re.search(r"(\d+)\s*gün", text)
-    if match:
-        return min(int(match.group(1)), 30)
-    return 3
-
-
-def is_order_report_request(text: str) -> bool:
-    keywords = ["sipariş", "satış", "rapor", "özet", "kazanç", "kâr", "gelir", "ciro", "kaç sipariş", "kaç satış"]
-    return any(kw in text.lower() for kw in keywords)
-
-
-def is_excel_request(text: str) -> bool:
-    keywords = ["excel", "xlsx", "dosya", "indir", "tablo"]
-    return any(kw in text.lower() for kw in keywords) and is_order_report_request(text)
 
 # ─── ImgBB ──────────────────────────────────────────────────────────────────
 
@@ -832,20 +890,21 @@ async def send_telegram(chat_id: int, text: str) -> None:
 
 
 async def handle_order_report(chat_id: int, text: str) -> None:
-    days       = extract_days(text)
-    want_excel = is_excel_request(text)
+    days            = extract_days(text)
+    want_excel      = is_excel_request(text)
+    supplier_filter = get_supplier_for_chat(chat_id)  # kısıtlı tedarikçi mi?
 
     await send_telegram(chat_id, f"⏳ Son {days} günlük gerçek veriler çekiliyor...")
-    orders = await fetch_orders(days)
+    orders = await fetch_orders(days, supplier_filter)
 
-    summary = summarize_orders(orders, days)
+    summary = summarize_orders(orders, days, supplier_filter)
     await send_telegram(chat_id, summary)
 
     if want_excel and orders:
-        filename    = f"siparis_raporu_{days}gun_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        excel_bytes = build_excel(orders, days)
+        suffix      = f"_{supplier_filter.replace(' ', '_')}" if supplier_filter else ""
+        filename    = f"siparis_raporu_{days}gun{suffix}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        excel_bytes = build_excel(orders, days, supplier_filter)
         await send_excel_to_telegram(chat_id, excel_bytes, filename)
-        log.info(f"Excel gönderildi: {filename}")
 
 
 async def handle_message(chat_id: int, text: str) -> None:
@@ -853,6 +912,11 @@ async def handle_message(chat_id: int, text: str) -> None:
         if is_order_report_request(text):
             await handle_order_report(chat_id, text)
         else:
+            # Kısıtlı tedarikçi agent'a yönlendirme yapmasın
+            supplier_filter = get_supplier_for_chat(chat_id)
+            if supplier_filter:
+                await send_telegram(chat_id, "⚠️ Sadece sipariş ve satış raporları için komut gönderebilirsiniz.")
+                return
             reply = await ask_claude(text)
             await send_telegram(chat_id, reply)
     except Exception as exc:
@@ -873,14 +937,18 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.error(f"Session başlatılamadı: {exc}")
 
-    scheduler.add_job(scheduled_carousel, CronTrigger(hour=9, minute=0))
+    # Carousel: 09:00, 12:00, 16:00, 21:00
+    scheduler.add_job(scheduled_carousel, CronTrigger(hour=9,  minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=12, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=16, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=21, minute=0))
+    # Reels: 10:30, 19:00
     scheduler.add_job(scheduled_reels,    CronTrigger(hour=10, minute=30))
     scheduler.add_job(scheduled_reels,    CronTrigger(hour=19, minute=0))
+    # Story: 14:00, 23:00
     scheduler.add_job(scheduled_story,    CronTrigger(hour=14, minute=0))
     scheduler.add_job(scheduled_story,    CronTrigger(hour=23, minute=0))
+    # Sipariş kontrolü: her 5 dakika
     scheduler.add_job(check_new_orders,   IntervalTrigger(minutes=5))
 
     scheduler.start()
