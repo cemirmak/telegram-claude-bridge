@@ -72,11 +72,12 @@ _posted_date: str          = ""
 _notified_orders: set      = set()
 SUPPLIER_DATA: list        = []
 BARCODE_SUPPLIER_MAP: dict = {}
+BARCODE_IMAGE_MAP: dict    = {}  # barkod → görsel URL
 
-# ─── Tedarikçi verisi ────────────────────────────────────────────────────────
+# ─── Tedarikçi ve görsel verisi ──────────────────────────────────────────────
 
 def load_supplier_data():
-    global SUPPLIER_DATA, BARCODE_SUPPLIER_MAP
+    global SUPPLIER_DATA, BARCODE_SUPPLIER_MAP, BARCODE_IMAGE_MAP
     try:
         with open(SUPPLIER_JSON, "r", encoding="utf-8") as f:
             SUPPLIER_DATA = json.load(f)
@@ -96,17 +97,27 @@ def load_supplier_data():
             beden     = str(row.get("Beden", "")).strip()
             key       = f"{model}-{beden}".lower()
             tedarikci = model_map.get(key, "")
+
             if sz_barkod and tedarikci:
                 BARCODE_SUPPLIER_MAP[sz_barkod] = tedarikci
                 count += 1
 
-        log.info(f"Tedarikçi haritası: {count} barkod eşleştirildi (JSON: {len(SUPPLIER_DATA)} kayıt)")
+            # Görsel URL'sini kaydet (Görsel 1)
+            gorsel = str(row.get("Görsel 1", "")).strip()
+            if sz_barkod and gorsel.startswith("http"):
+                BARCODE_IMAGE_MAP[sz_barkod] = gorsel
+
+        log.info(f"Tedarikçi haritası: {count} barkod | Görsel haritası: {len(BARCODE_IMAGE_MAP)} barkod")
     except Exception as e:
         log.error(f"Tedarikçi verisi yüklenemedi: {e}")
 
 
 def match_supplier(barcode: str) -> str:
     return BARCODE_SUPPLIER_MAP.get(str(barcode).strip(), "")
+
+
+def get_product_image(barcode: str) -> str:
+    return BARCODE_IMAGE_MAP.get(str(barcode).strip(), "")
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
@@ -214,10 +225,9 @@ def get_trendyol_headers() -> dict:
 async def fetch_orders(days: int = 1) -> list:
     end_ms   = int(datetime.now().timestamp() * 1000)
     start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-
-    url        = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
+    url      = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
     all_orders = []
-    page       = 0
+    page = 0
 
     while True:
         params = {
@@ -247,9 +257,8 @@ async def fetch_orders(days: int = 1) -> list:
 async def fetch_new_orders() -> list:
     end_ms   = int(datetime.now().timestamp() * 1000)
     start_ms = int((datetime.now() - timedelta(minutes=30)).timestamp() * 1000)
-
-    url    = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
-    params = {
+    url      = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
+    params   = {
         "startDate": start_ms, "endDate": end_ms,
         "size": 50, "page": 0,
         "orderByField": "OrderDate", "orderByDirection": "DESC",
@@ -265,9 +274,108 @@ async def fetch_new_orders() -> list:
         log.error(f"Trendyol fetch hatası: {e}")
         return []
 
+# ─── Telegram mesaj gönderme ─────────────────────────────────────────────────
+
+async def send_telegram_to(chat_id: int, text: str) -> None:
+    if not chat_id:
+        return
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"{TELEGRAM_BASE}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+
+
+async def send_photo_to_telegram(chat_id: int, photo_url: str, caption: str) -> bool:
+    """Fotoğrafı URL üzerinden Telegram'a gönderir."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{TELEGRAM_BASE}/sendPhoto",
+                json={
+                    "chat_id": chat_id,
+                    "photo":   photo_url,
+                    "caption": caption,
+                    "parse_mode": "Markdown",
+                },
+            )
+        return r.status_code == 200
+    except Exception as e:
+        log.error(f"Fotoğraf gönderme hatası: {e}")
+        return False
+
+
+async def send_excel_to_telegram(chat_id: int, excel_bytes: bytes, filename: str) -> None:
+    async with httpx.AsyncClient(timeout=60) as client:
+        await client.post(
+            f"{TELEGRAM_BASE}/sendDocument",
+            data={"chat_id": str(chat_id)},
+            files={"document": (filename, excel_bytes,
+                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+
+# ─── Sipariş bildirimi ───────────────────────────────────────────────────────
+
+async def check_new_orders():
+    global _notified_orders
+
+    if not TRENDYOL_API_KEY or not TRENDYOL_API_SECRET:
+        return
+
+    orders = await fetch_new_orders()
+    if not orders:
+        return
+
+    for order in orders:
+        order_id = str(order.get("id") or order.get("shipmentPackageId", ""))
+        if not order_id or order_id in _notified_orders:
+            continue
+
+        for line in order.get("lines", []):
+            product_name = line.get("productName", "")
+            barcode      = line.get("barcode", "")
+            quantity     = line.get("quantity", 1)
+            size         = line.get("productSize", "")
+            amount       = line.get("amount", 0)
+            order_no     = order.get("orderNumber", order_id)
+
+            supplier = match_supplier(barcode)
+            chat_id  = SUPPLIER_CHAT_IDS.get(supplier, 0)
+
+            log.info(f"Sipariş: {product_name} | Barkod: {barcode} | Tedarikçi: {supplier or 'bulunamadı'}")
+
+            if not chat_id:
+                continue
+
+            caption = f"""🛍 *Yeni Sipariş #{order_no}*
+
+📦 *{product_name}*
+📏 Beden: {size}
+🔢 Adet: {quantity}
+💰 Tutar: {amount:.2f}₺
+
+Lütfen hazırlayınız ✅"""
+
+            # Önce görsel gönder
+            image_url = get_product_image(barcode)
+            if image_url:
+                sent = await send_photo_to_telegram(chat_id, image_url, caption)
+                if not sent:
+                    # Görsel gönderilemezse sadece metin gönder
+                    await send_telegram_to(chat_id, caption)
+            else:
+                await send_telegram_to(chat_id, caption)
+
+            log.info(f"Bildirim → {supplier}: {product_name} ({size})")
+
+        _notified_orders.add(order_id)
+        if len(_notified_orders) > 1000:
+            _notified_orders = set(list(_notified_orders)[-500:])
+
+# ─── Excel oluşturma ─────────────────────────────────────────────────────────
 
 def build_excel(orders: list, days: int) -> bytes:
-    """Sipariş listesinden 3 sayfalı Excel oluşturur."""
     rows = []
     for order in orders:
         order_no   = order.get("orderNumber", "")
@@ -292,7 +400,6 @@ def build_excel(orders: list, days: int) -> bytes:
             })
 
     df_orders = pd.DataFrame(rows)
-
     supplier_summary = pd.DataFrame()
     product_summary  = pd.DataFrame()
 
@@ -316,7 +423,6 @@ def build_excel(orders: list, days: int) -> bytes:
         if not product_summary.empty:
             product_summary.to_excel(writer, sheet_name="Ürün Bazlı", index=False)
 
-        # Tüm sayfalarda sütun genişliklerini otomatik ayarla
         for sheet in writer.sheets.values():
             for col in sheet.columns:
                 max_len = max(
@@ -419,62 +525,6 @@ def is_order_report_request(text: str) -> bool:
 def is_excel_request(text: str) -> bool:
     keywords = ["excel", "xlsx", "dosya", "indir", "tablo"]
     return any(kw in text.lower() for kw in keywords) and is_order_report_request(text)
-
-# ─── Telegram dosya gönderme ─────────────────────────────────────────────────
-
-async def send_excel_to_telegram(chat_id: int, excel_bytes: bytes, filename: str) -> None:
-    async with httpx.AsyncClient(timeout=60) as client:
-        await client.post(
-            f"{TELEGRAM_BASE}/sendDocument",
-            data={"chat_id": str(chat_id)},
-            files={"document": (filename, excel_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-        )
-
-# ─── Sipariş kontrolü ────────────────────────────────────────────────────────
-
-async def check_new_orders():
-    global _notified_orders
-
-    if not TRENDYOL_API_KEY or not TRENDYOL_API_SECRET:
-        return
-
-    orders = await fetch_new_orders()
-    if not orders:
-        return
-
-    for order in orders:
-        order_id = str(order.get("id") or order.get("shipmentPackageId", ""))
-        if not order_id or order_id in _notified_orders:
-            continue
-
-        for line in order.get("lines", []):
-            product_name = line.get("productName", "")
-            barcode      = line.get("barcode", "")
-            quantity     = line.get("quantity", 1)
-            size         = line.get("productSize", "")
-            amount       = line.get("amount", 0)
-
-            supplier = match_supplier(barcode)
-            chat_id  = SUPPLIER_CHAT_IDS.get(supplier, 0)
-
-            log.info(f"Sipariş: {product_name} | Barkod: {barcode} | Tedarikçi: {supplier or 'bulunamadı'}")
-
-            if chat_id:
-                msg = f"""🛍 *Yeni Sipariş!*
-
-📦 *{product_name}*
-📏 Beden: {size}
-🔢 Adet: {quantity}
-💰 Tutar: {amount:.2f}₺
-🏪 Sipariş No: {order.get('orderNumber', order_id)}
-
-Lütfen hazırlayınız ✅"""
-                await send_telegram_to(chat_id, msg)
-                log.info(f"Bildirim → {supplier}: {product_name} ({size})")
-
-        _notified_orders.add(order_id)
-        if len(_notified_orders) > 1000:
-            _notified_orders = set(list(_notified_orders)[-500:])
 
 # ─── ImgBB ──────────────────────────────────────────────────────────────────
 
@@ -774,17 +824,6 @@ async def notify_telegram(text: str):
     if not TELEGRAM_CHAT_ID:
         return
     await send_telegram_to(int(TELEGRAM_CHAT_ID), text)
-
-
-async def send_telegram_to(chat_id: int, text: str) -> None:
-    if not chat_id:
-        return
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            f"{TELEGRAM_BASE}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-            timeout=10,
-        )
 
 # ─── Telegram ───────────────────────────────────────────────────────────────
 
