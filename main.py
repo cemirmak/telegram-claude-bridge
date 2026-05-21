@@ -54,7 +54,7 @@ POLL_INTERVAL = 2
 POLL_TIMEOUT  = 300
 
 # Ürün Excel dosyası — Render'da /tmp'ye kopyalanır
-EXCEL_PATH = "/tmp/urunler.xlsx"
+EXCEL_PATH = "urunler.xlsx"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
