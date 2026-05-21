@@ -313,40 +313,6 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
         )
         return r.json()
 
-
-async def post_to_social_media(trendyol_image_urls: list, caption: str, video_url: str = "") -> dict:
-    log.info(f"{len(trendyol_image_urls)} görsel ImgBB'ye yükleniyor...")
-    imgbb_urls = []
-    for url in trendyol_image_urls[:10]:
-        imgbb_url = await upload_to_imgbb(url)
-        if imgbb_url:
-            imgbb_urls.append(imgbb_url)
-
-    if not imgbb_urls:
-        return {"error": "Hiç görsel ImgBB'ye yüklenemedi"}
-
-    results = {}
-
-    # Carousel
-    log.info("Carousel paylaşılıyor...")
-    results["instagram_carousel"] = await instagram_carousel_post(imgbb_urls, caption)
-    results["facebook_carousel"]  = await facebook_carousel_post(imgbb_urls, caption)
-
-    # Story
-    log.info("Story paylaşılıyor...")
-    results["instagram_story"] = await instagram_story_post(imgbb_urls[0])
-    results["facebook_story"]  = await facebook_story_post(imgbb_urls[0])
-
-    # Reels
-    if video_url:
-        log.info(f"Reels paylaşılıyor: {video_url}")
-        results["instagram_reels"] = await instagram_reels_post(video_url, caption)
-        results["facebook_reels"]  = await facebook_reels_post(video_url, caption)
-    else:
-        log.info("Video URL yok, Reels atlandı")
-
-    return results
-
 # ─── Ürün seçimi ────────────────────────────────────────────────────────────
 
 def load_products() -> pd.DataFrame:
@@ -358,7 +324,7 @@ def load_products() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def pick_product(df: pd.DataFrame) -> dict:
+def pick_product(df: pd.DataFrame, require_video: bool = False) -> dict:
     global _posted_today, _posted_date
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -371,6 +337,12 @@ def pick_product(df: pd.DataFrame) -> dict:
         _posted_today = set()
         available = df
 
+    # Video gerekliyse sadece video URL'si olan ürünleri seç
+    if require_video and "Video URL" in df.columns:
+        with_video = available[available["Video URL"].notna() & (available["Video URL"] != "")]
+        if not with_video.empty:
+            available = with_video
+
     row = available.sample(1).iloc[0]
     _posted_today.add(row["Model Kodu"])
 
@@ -382,12 +354,11 @@ def pick_product(df: pd.DataFrame) -> dict:
 
     fiyat_col = "Trendyol'da Satılacak Fiyat (KDV Dahil)"
 
-    # Video URL kolonu
     video_url = ""
     if "Video URL" in df.columns and pd.notna(row.get("Video URL")):
-        video_url = str(row.get("Video URL", "")).strip()
-        if not video_url.startswith("http"):
-            video_url = ""
+        v = str(row.get("Video URL", "")).strip()
+        if v.startswith("http"):
+            video_url = v
 
     return {
         "name":       row["Ürün Adı"],
@@ -429,9 +400,11 @@ Sadece caption metnini döndür."""
 
     return caption
 
+# ─── Zamanlanmış görevler ───────────────────────────────────────────────────
 
-async def scheduled_post():
-    log.info("⏰ Zamanlanmış paylaşım başlıyor...")
+async def scheduled_carousel():
+    """Günde 3x — 10:00, 14:00, 20:00 — Carousel post."""
+    log.info("⏰ Carousel paylaşımı başlıyor...")
 
     df = load_products()
     if df.empty:
@@ -439,28 +412,87 @@ async def scheduled_post():
         return
 
     product = pick_product(df)
-    log.info(f"Seçilen ürün: {product['name']} | Video: {product['video_url'] or 'yok'}")
+    log.info(f"Carousel ürün: {product['name']}")
 
     if not product["image_urls"]:
-        log.error(f"Görsel bulunamadı: {product['name']}")
         return
 
-    caption   = await generate_caption(product)
-    video_url = product["video_url"]
-    results   = await post_to_social_media(product["image_urls"], caption, video_url)
+    imgbb_urls = []
+    for url in product["image_urls"][:10]:
+        imgbb_url = await upload_to_imgbb(url)
+        if imgbb_url:
+            imgbb_urls.append(imgbb_url)
 
-    def ok(key): return "id" in str(results.get(key, {})) and "error" not in str(results.get(key, {}).get("error", ""))
+    if not imgbb_urls:
+        await notify_telegram("❌ Görsel yüklenemedi.")
+        return
 
-    reels_line = f"\nReels IG: {'✅' if ok('instagram_reels') else '❌'} | FB: {'✅' if ok('facebook_reels') else '❌'}" if video_url else "\nReels: video yok"
+    caption = await generate_caption(product)
 
-    msg = f"""📱 *Otomatik Paylaşım*
+    ig = await instagram_carousel_post(imgbb_urls, caption)
+    fb = await facebook_carousel_post(imgbb_urls, caption)
 
-Ürün: {product['name']}
-Carousel IG: {"✅" if ok('instagram_carousel') else "❌"} | FB: {"✅" if ok('facebook_carousel') else "❌"}
-Story IG: {"✅" if ok('instagram_story') else "❌"} | FB: {"✅" if ok('facebook_story') else "❌"}{reels_line}"""
+    ig_ok = "id" in str(ig)
+    fb_ok = "id" in str(fb)
 
-    await notify_telegram(msg)
-    log.info(f"Tamamlandı: {results}")
+    await notify_telegram(f"📸 *Carousel Post*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'} | FB: {'✅' if fb_ok else '❌'}")
+
+
+async def scheduled_reels():
+    """Günde 1x — 20:30 — Reels video."""
+    log.info("⏰ Reels paylaşımı başlıyor...")
+
+    df = load_products()
+    if df.empty:
+        await notify_telegram("❌ Ürün listesi bulunamadı.")
+        return
+
+    product = pick_product(df, require_video=True)
+
+    if not product["video_url"]:
+        log.info("Video URL bulunamadı, Reels atlandı.")
+        await notify_telegram("⚠️ Reels: Video URL'si olan ürün bulunamadı.")
+        return
+
+    log.info(f"Reels ürün: {product['name']} | Video: {product['video_url']}")
+
+    caption = await generate_caption(product)
+
+    ig = await instagram_reels_post(product["video_url"], caption)
+    fb = await facebook_reels_post(product["video_url"], caption)
+
+    ig_ok = "id" in str(ig)
+    fb_ok = "id" in str(fb)
+
+    await notify_telegram(f"🎬 *Reels*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'} | FB: {'✅' if fb_ok else '❌'}")
+
+
+async def scheduled_story():
+    """Günde 1x — 00:00 — Story."""
+    log.info("⏰ Story paylaşımı başlıyor...")
+
+    df = load_products()
+    if df.empty:
+        await notify_telegram("❌ Ürün listesi bulunamadı.")
+        return
+
+    product = pick_product(df)
+
+    if not product["image_urls"]:
+        return
+
+    imgbb_url = await upload_to_imgbb(product["image_urls"][0])
+    if not imgbb_url:
+        await notify_telegram("❌ Story: Görsel yüklenemedi.")
+        return
+
+    ig = await instagram_story_post(imgbb_url)
+    fb = await facebook_story_post(imgbb_url)
+
+    ig_ok = "id" in str(ig)
+    fb_ok = "id" in str(fb)
+
+    await notify_telegram(f"📖 *Story*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'} | FB: {'✅' if fb_ok else '❌'}")
 
 
 async def notify_telegram(text: str):
@@ -503,11 +535,17 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.error(f"Session başlatılamadı: {exc}")
 
-    scheduler.add_job(scheduled_post, CronTrigger(hour=10, minute=0))
-    scheduler.add_job(scheduled_post, CronTrigger(hour=14, minute=0))
-    scheduler.add_job(scheduled_post, CronTrigger(hour=20, minute=0))
+    # Carousel — 10:00, 14:00, 20:00
+    scheduler.add_job(scheduled_carousel, CronTrigger(hour=10, minute=0))
+    scheduler.add_job(scheduled_carousel, CronTrigger(hour=14, minute=0))
+    scheduler.add_job(scheduled_carousel, CronTrigger(hour=20, minute=0))
+    # Reels — 20:30
+    scheduler.add_job(scheduled_reels, CronTrigger(hour=20, minute=30))
+    # Story — 00:00
+    scheduler.add_job(scheduled_story, CronTrigger(hour=0, minute=0))
+
     scheduler.start()
-    log.info("⏰ Zamanlayıcı: 10:00, 14:00, 20:00 (TR)")
+    log.info("⏰ Zamanlayıcı: Carousel 10:00/14:00/20:00 | Reels 20:30 | Story 00:00 (TR)")
 
     yield
     scheduler.shutdown()
@@ -536,8 +574,18 @@ async def webhook(request: Request, background: BackgroundTasks):
         return JSONResponse({"ok": True})
 
     if text.startswith("/post_now"):
-        background.add_task(scheduled_post)
-        await send_telegram(chat_id, "📤 Manuel paylaşım başlatıldı...")
+        background.add_task(scheduled_carousel)
+        await send_telegram(chat_id, "📸 Manuel carousel paylaşımı başlatıldı...")
+        return JSONResponse({"ok": True})
+
+    if text.startswith("/reels_now"):
+        background.add_task(scheduled_reels)
+        await send_telegram(chat_id, "🎬 Manuel Reels paylaşımı başlatıldı...")
+        return JSONResponse({"ok": True})
+
+    if text.startswith("/story_now"):
+        background.add_task(scheduled_story)
+        await send_telegram(chat_id, "📖 Manuel Story paylaşımı başlatıldı...")
         return JSONResponse({"ok": True})
 
     background.add_task(handle_message, chat_id, text)
