@@ -15,7 +15,7 @@ Ortam değişkenleri (Render.com Environment):
   TELEGRAM_CHAT_ID      — Bildirim gönderilecek Telegram chat ID
 """
 
-import os, asyncio, logging, time, base64, random
+import os, asyncio, logging, time, base64, re
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -52,8 +52,7 @@ CLAUDE_HEADERS = {
 
 POLL_INTERVAL = 2
 POLL_TIMEOUT  = 300
-
-EXCEL_PATH = "urunler.xlsx"
+EXCEL_PATH    = "urunler.xlsx"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -128,7 +127,6 @@ async def ask_claude(user_text: str) -> str:
 
         data = r.json()
         events = data.get("events", data.get("data", []))
-
         if len(events) != last_count:
             last_count = len(events)
 
@@ -140,14 +138,12 @@ async def ask_claude(user_text: str) -> str:
             last = status_events[-1]
             if last.get("type") == "session.status_idle":
                 stop = last.get("stop_reason") or {}
-                stop_type = stop.get("type") if isinstance(stop, dict) else stop
-                if stop_type == "end_turn":
+                if (stop.get("type") if isinstance(stop, dict) else stop) == "end_turn":
                     return _extract_answer(events)
 
         errors = [e for e in events if e.get("type") == "session.error"]
         if errors:
-            msg = errors[-1].get("error", {}).get("message", str(errors[-1]))
-            return f"❌ Agent hatası: {msg}"
+            return f"❌ Agent hatası: {errors[-1].get('error', {}).get('message', '')}"
 
     return "⏱ Agent zamanında cevap veremedi."
 
@@ -159,6 +155,38 @@ def _extract_answer(events: list) -> str:
     parts = [b["text"] for b in msgs[-1].get("content", []) if isinstance(b, dict) and b.get("type") == "text"]
     return "\n".join(parts) if parts else "🤔 Boş cevap."
 
+# ─── Trendyol video çekme ───────────────────────────────────────────────────
+
+async def fetch_trendyol_video(product_url: str) -> str:
+    """Trendyol ürün sayfasından video URL'sini çeker."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "tr-TR,tr;q=0.9",
+        }
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            r = await client.get(product_url, headers=headers)
+            if r.status_code != 200:
+                log.warning(f"Trendyol sayfası açılamadı: {r.status_code}")
+                return ""
+
+            html = r.text
+            # video-content.dsmcdn.com URL'sini bul
+            matches = re.findall(
+                r'https://video-content\.dsmcdn\.com/[^\s"\']+\.mp4',
+                html
+            )
+            if matches:
+                video_url = matches[0]
+                log.info(f"Video bulundu: {video_url}")
+                return video_url
+
+            log.info("Bu üründe video yok")
+            return ""
+    except Exception as e:
+        log.error(f"Video çekme hatası: {e}")
+        return ""
+
 # ─── ImgBB ──────────────────────────────────────────────────────────────────
 
 async def upload_to_imgbb(image_url: str) -> str:
@@ -166,19 +194,15 @@ async def upload_to_imgbb(image_url: str) -> str:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(image_url, follow_redirects=True)
             if r.status_code != 200:
-                log.error(f"Görsel indirilemedi ({r.status_code}): {image_url}")
                 return ""
             image_data = base64.b64encode(r.content).decode("utf-8")
-
             r = await client.post(
                 IMGBB_BASE,
                 data={"key": IMGBB_API_KEY, "image": image_data},
             )
             result = r.json()
             if result.get("success"):
-                url = result["data"]["url"]
-                log.info(f"ImgBB: {url}")
-                return url
+                return result["data"]["url"]
             log.error(f"ImgBB hatası: {result}")
             return ""
     except Exception as e:
@@ -193,11 +217,7 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
         for url in image_urls:
             r = await client.post(
                 f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
-                params={
-                    "image_url": url,
-                    "is_carousel_item": "true",
-                    "access_token": META_ACCESS_TOKEN,
-                },
+                params={"image_url": url, "is_carousel_item": "true", "access_token": META_ACCESS_TOKEN},
             )
             data = r.json()
             if "id" in data:
@@ -210,26 +230,106 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
 
         r = await client.post(
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
-            params={
-                "media_type": "CAROUSEL",
-                "children": ",".join(container_ids),
-                "caption": caption,
-                "access_token": META_ACCESS_TOKEN,
-            },
+            params={"media_type": "CAROUSEL", "children": ",".join(container_ids), "caption": caption, "access_token": META_ACCESS_TOKEN},
         )
         carousel = r.json()
         if "id" not in carousel:
             return {"error": str(carousel)}
 
-        # Instagram container hazır olana kadar bekle
         await asyncio.sleep(15)
 
         r = await client.post(
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
+            params={"creation_id": carousel["id"], "access_token": META_ACCESS_TOKEN},
+        )
+        return r.json()
+
+
+async def instagram_reels_post(video_url: str, caption: str) -> dict:
+    """Instagram Reels paylaşımı — video URL ile."""
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
             params={
-                "creation_id": carousel["id"],
+                "media_type": "REELS",
+                "video_url": video_url,
+                "caption": caption,
                 "access_token": META_ACCESS_TOKEN,
             },
+        )
+        data = r.json()
+        if "id" not in data:
+            return {"error": str(data)}
+
+        # Video işleme süresi
+        await asyncio.sleep(30)
+
+        r = await client.post(
+            f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
+            params={"creation_id": data["id"], "access_token": META_ACCESS_TOKEN},
+        )
+        return r.json()
+
+
+async def instagram_story_post(image_url: str) -> dict:
+    """Instagram Story paylaşımı — tek görsel."""
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
+            params={
+                "media_type": "STORIES",
+                "image_url": image_url,
+                "access_token": META_ACCESS_TOKEN,
+            },
+        )
+        data = r.json()
+        if "id" not in data:
+            return {"error": str(data)}
+
+        await asyncio.sleep(10)
+
+        r = await client.post(
+            f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
+            params={"creation_id": data["id"], "access_token": META_ACCESS_TOKEN},
+        )
+        return r.json()
+
+
+async def facebook_reels_post(video_url: str, caption: str) -> dict:
+    """Facebook Reels paylaşımı."""
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
+            params={
+                "upload_phase": "start",
+                "access_token": META_ACCESS_TOKEN,
+            },
+        )
+        data = r.json()
+        video_id = data.get("video_id")
+        if not video_id:
+            return {"error": str(data)}
+
+        # Video URL ile yükle
+        r = await client.post(
+            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
+            params={
+                "upload_phase": "finish",
+                "video_id": video_id,
+                "video_url": video_url,
+                "description": caption,
+                "access_token": META_ACCESS_TOKEN,
+            },
+        )
+        return r.json()
+
+
+async def facebook_story_post(image_url: str) -> dict:
+    """Facebook Story paylaşımı."""
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photo_stories",
+            params={"url": image_url, "access_token": META_ACCESS_TOKEN},
         )
         return r.json()
 
@@ -240,11 +340,7 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
         for url in image_urls:
             r = await client.post(
                 f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photos",
-                params={
-                    "url": url,
-                    "published": "false",
-                    "access_token": META_ACCESS_TOKEN,
-                },
+                params={"url": url, "published": "false", "access_token": META_ACCESS_TOKEN},
             )
             data = r.json()
             if "id" in data:
@@ -263,7 +359,8 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
         return r.json()
 
 
-async def post_to_social_media(trendyol_image_urls: list, caption: str) -> dict:
+async def post_to_social_media(trendyol_image_urls: list, caption: str, video_url: str = "") -> dict:
+    """Görselleri ImgBB'ye yükler, carousel + story + reels paylaşır."""
     log.info(f"{len(trendyol_image_urls)} görsel ImgBB'ye yükleniyor...")
     imgbb_urls = []
     for url in trendyol_image_urls[:10]:
@@ -274,12 +371,27 @@ async def post_to_social_media(trendyol_image_urls: list, caption: str) -> dict:
     if not imgbb_urls:
         return {"error": "Hiç görsel ImgBB'ye yüklenemedi"}
 
-    log.info(f"{len(imgbb_urls)} görsel yüklendi, paylaşılıyor...")
+    results = {}
 
-    ig_result = await instagram_carousel_post(imgbb_urls, caption)
-    fb_result = await facebook_carousel_post(imgbb_urls, caption)
+    # 1) Carousel post (Instagram + Facebook)
+    log.info("Carousel post paylaşılıyor...")
+    results["instagram_carousel"] = await instagram_carousel_post(imgbb_urls, caption)
+    results["facebook_carousel"]  = await facebook_carousel_post(imgbb_urls, caption)
 
-    return {"instagram": ig_result, "facebook": fb_result}
+    # 2) Story (Instagram + Facebook) — ilk görseli kullan
+    log.info("Story paylaşılıyor...")
+    results["instagram_story"] = await instagram_story_post(imgbb_urls[0])
+    results["facebook_story"]  = await facebook_story_post(imgbb_urls[0])
+
+    # 3) Reels — video varsa
+    if video_url:
+        log.info(f"Reels paylaşılıyor: {video_url}")
+        results["instagram_reels"] = await instagram_reels_post(video_url, caption)
+        results["facebook_reels"]  = await facebook_reels_post(video_url, caption)
+    else:
+        log.info("Video bulunamadı, Reels atlandı")
+
+    return results
 
 # ─── Ürün seçimi ve caption ──────────────────────────────────────────────────
 
@@ -326,24 +438,24 @@ def pick_product(df: pd.DataFrame) -> dict:
 
 
 async def generate_caption(product: dict) -> str:
-    prompt = f"""Şu ürün için Instagram/Facebook carousel post caption'ı yaz:
+    prompt = f"""Şu ürün için Instagram/Facebook post caption'ı yaz:
 
 Ürün: {product['name']}
 Fiyat: {product['price']}₺
 Link: {product['link']}
 Açıklama: {product['desc'][:300]}
 
-ZORUNLU FORMAT (sırayla):
+ZORUNLU FORMAT:
 1. Satır 1: {product['link']}
 2. Türkçe etkileyici açıklama (2-3 cümle)
 3. 💰 Fiyat: {product['price']}₺
 4. En az 15 hashtag
 
-Sadece caption metnini döndür, başka hiçbir şey yazma."""
+Sadece caption metnini döndür."""
 
     caption = await ask_claude(prompt)
 
-    if "❌" in caption or "⏱" in caption or "🤔" in caption:
+    if any(x in caption for x in ["❌", "⏱", "🤔"]):
         caption = f"""{product['link']}
 
 {product['name']} — Tarzını yansıt, stilini konuştur! ✨
@@ -360,7 +472,7 @@ async def scheduled_post():
 
     df = load_products()
     if df.empty:
-        await notify_telegram("❌ Ürün listesi bulunamadı, paylaşım yapılamadı.")
+        await notify_telegram("❌ Ürün listesi bulunamadı.")
         return
 
     product = pick_product(df)
@@ -370,20 +482,29 @@ async def scheduled_post():
         log.error(f"Görsel bulunamadı: {product['name']}")
         return
 
-    caption = await generate_caption(product)
-    results = await post_to_social_media(product["image_urls"], caption)
+    # Trendyol'dan video çek
+    video_url = await fetch_trendyol_video(str(product["link"]))
 
-    ig_ok = "id" in str(results.get("instagram", {})) and "error" not in str(results.get("instagram", {}).get("error", ""))
-    fb_ok = "id" in str(results.get("facebook", {}))
+    caption = await generate_caption(product)
+    results = await post_to_social_media(product["image_urls"], caption, video_url)
+
+    ig_carousel = "id" in str(results.get("instagram_carousel", {}))
+    fb_carousel  = "id" in str(results.get("facebook_carousel", {}))
+    ig_story     = "id" in str(results.get("instagram_story", {}))
+    fb_story     = "id" in str(results.get("facebook_story", {}))
+    ig_reels     = "id" in str(results.get("instagram_reels", {})) if video_url else None
+    fb_reels     = "id" in str(results.get("facebook_reels", {})) if video_url else None
+
+    reels_line = f"\nReels IG: {'✅' if ig_reels else '❌'} | FB: {'✅' if fb_reels else '❌'}" if video_url else "\nReels: video yok"
 
     msg = f"""📱 *Otomatik Paylaşım*
 
 Ürün: {product['name']}
-Instagram: {"✅" if ig_ok else "❌"}
-Facebook: {"✅" if fb_ok else "❌"}"""
+Carousel IG: {"✅" if ig_carousel else "❌"} | FB: {"✅" if fb_carousel else "❌"}
+Story IG: {"✅" if ig_story else "❌"} | FB: {"✅" if fb_story else "❌"}{reels_line}"""
 
     await notify_telegram(msg)
-    log.info(f"Paylaşım tamamlandı: {results}")
+    log.info(f"Tamamlandı: {results}")
 
 
 async def notify_telegram(text: str):
@@ -430,7 +551,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(scheduled_post, CronTrigger(hour=14, minute=0))
     scheduler.add_job(scheduled_post, CronTrigger(hour=20, minute=0))
     scheduler.start()
-    log.info("⏰ Zamanlayıcı başlatıldı: 10:00, 14:00, 20:00 (TR saati)")
+    log.info("⏰ Zamanlayıcı: 10:00, 14:00, 20:00 (TR)")
 
     yield
     scheduler.shutdown()
@@ -468,17 +589,11 @@ async def webhook(request: Request, background: BackgroundTasks):
     return JSONResponse({"ok": True})
 
 
-@app.post("/post-product")
-async def post_product(request: Request):
-    body = await request.json()
-    image_urls = body.get("image_urls", [])
-    caption    = body.get("caption", "")
-
-    if not image_urls or not caption:
-        return JSONResponse({"error": "image_urls ve caption zorunlu"}, status_code=400)
-
-    results = await post_to_social_media(image_urls, caption)
-    return JSONResponse(results)
+@app.get("/test-video")
+async def test_video(url: str):
+    """Trendyol ürün sayfasından video URL'si test et."""
+    video_url = await fetch_trendyol_video(url)
+    return {"video_url": video_url or "bulunamadı"}
 
 
 @app.get("/")
