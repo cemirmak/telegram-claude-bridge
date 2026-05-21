@@ -20,7 +20,8 @@ TELEGRAM_TOKEN       = os.environ["TELEGRAM_TOKEN"]
 AGENT_ID             = os.environ["AGENT_ID"]
 SESSION_ID           = os.environ.get("SESSION_ID", "")
 ENV_ID               = os.environ["ENV_ID"]
-META_ACCESS_TOKEN    = os.environ.get("META_ACCESS_TOKEN", "")
+META_ACCESS_TOKEN    = os.environ.get("META_ACCESS_TOKEN", "")      # Instagram token
+FACEBOOK_ACCESS_TOKEN = os.environ.get("FACEBOOK_ACCESS_TOKEN", "") # Facebook token (workflow app)
 INSTAGRAM_ACCOUNT_ID = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
 FACEBOOK_PAGE_ID     = os.environ.get("FACEBOOK_PAGE_ID", "")
 IMGBB_API_KEY        = os.environ.get("IMGBB_API_KEY", "")
@@ -165,7 +166,7 @@ async def upload_to_imgbb(image_url: str) -> str:
         log.error(f"ImgBB exception: {e}")
         return ""
 
-# ─── Meta Graph API ─────────────────────────────────────────────────────────
+# ─── Instagram API (META_ACCESS_TOKEN) ──────────────────────────────────────
 
 async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
     async with httpx.AsyncClient(timeout=60) as client:
@@ -208,12 +209,7 @@ async def instagram_reels_post(video_url: str, caption: str) -> dict:
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
-            params={
-                "media_type": "REELS",
-                "video_url": video_url,
-                "caption": caption,
-                "access_token": META_ACCESS_TOKEN,
-            },
+            params={"media_type": "REELS", "video_url": video_url, "caption": caption, "access_token": META_ACCESS_TOKEN},
         )
         if r.status_code != 200:
             log.error(f"Instagram Reels container hatası: {r.status_code} {r.text}")
@@ -258,12 +254,40 @@ async def instagram_story_post(image_url: str) -> dict:
             log.error(f"Instagram Story publish hatası: {r.status_code} {r.text}")
         return r.json()
 
+# ─── Facebook API (FACEBOOK_ACCESS_TOKEN) ───────────────────────────────────
+
+async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
+    async with httpx.AsyncClient(timeout=60) as client:
+        photo_ids = []
+        for url in image_urls:
+            r = await client.post(
+                f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photos",
+                params={"url": url, "published": "false", "access_token": FACEBOOK_ACCESS_TOKEN},
+            )
+            data = r.json()
+            if "id" in data:
+                photo_ids.append({"media_fbid": data["id"]})
+            else:
+                log.error(f"Facebook foto hatası: {data}")
+
+        if not photo_ids:
+            return {"error": "Hiç fotoğraf yüklenemedi"}
+
+        r = await client.post(
+            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/feed",
+            params={"access_token": FACEBOOK_ACCESS_TOKEN},
+            json={"message": caption, "attached_media": photo_ids},
+        )
+        if r.status_code != 200:
+            log.error(f"Facebook carousel hatası: {r.status_code} {r.text}")
+        return r.json()
+
 
 async def facebook_reels_post(video_url: str, caption: str) -> dict:
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
             f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
-            params={"upload_phase": "start", "access_token": META_ACCESS_TOKEN},
+            params={"upload_phase": "start", "access_token": FACEBOOK_ACCESS_TOKEN},
         )
         if r.status_code != 200:
             log.error(f"Facebook Reels start hatası: {r.status_code} {r.text}")
@@ -281,7 +305,7 @@ async def facebook_reels_post(video_url: str, caption: str) -> dict:
                 "video_id": video_id,
                 "video_url": video_url,
                 "description": caption,
-                "access_token": META_ACCESS_TOKEN,
+                "access_token": FACEBOOK_ACCESS_TOKEN,
             },
         )
         if r.status_code != 200:
@@ -290,45 +314,13 @@ async def facebook_reels_post(video_url: str, caption: str) -> dict:
 
 
 async def facebook_story_post(image_url: str) -> dict:
-    """Facebook sayfasına fotoğraf paylaşır (story yerine normal post)."""
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
-            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photos",
-            params={
-                "url": image_url,
-                "published": "true",
-                "access_token": META_ACCESS_TOKEN,
-            },
+            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photo_stories",
+            params={"url": image_url, "access_token": FACEBOOK_ACCESS_TOKEN},
         )
         if r.status_code != 200:
-            log.error(f"Facebook foto hatası: {r.status_code} {r.text}")
-        return r.json()
-
-
-async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
-    async with httpx.AsyncClient(timeout=60) as client:
-        photo_ids = []
-        for url in image_urls:
-            r = await client.post(
-                f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photos",
-                params={"url": url, "published": "false", "access_token": META_ACCESS_TOKEN},
-            )
-            data = r.json()
-            if "id" in data:
-                photo_ids.append({"media_fbid": data["id"]})
-            else:
-                log.error(f"Facebook foto hatası: {data}")
-
-        if not photo_ids:
-            return {"error": "Hiç fotoğraf yüklenemedi"}
-
-        r = await client.post(
-            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/feed",
-            params={"access_token": META_ACCESS_TOKEN},
-            json={"message": caption, "attached_media": photo_ids},
-        )
-        if r.status_code != 200:
-            log.error(f"Facebook carousel hatası: {r.status_code} {r.text}")
+            log.error(f"Facebook Story hatası: {r.status_code} {r.text}")
         return r.json()
 
 # ─── Ürün seçimi ────────────────────────────────────────────────────────────
@@ -373,7 +365,6 @@ def pick_product(df: pd.DataFrame, require_video: bool = False) -> dict:
     ]
 
     fiyat_col = "Trendyol'da Satılacak Fiyat (KDV Dahil)"
-
     video_url = ""
     if "Video URL" in df.columns and pd.notna(row.get("Video URL")):
         v = str(row.get("Video URL", "")).strip()
