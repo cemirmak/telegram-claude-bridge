@@ -69,32 +69,50 @@ SUPPLIER_JSON = "tedarikci-eslesme.json"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-_active_session_id: str = SESSION_ID
-_posted_today: set = set()
-_posted_date: str = ""
-_notified_orders: set = set()
-SUPPLIER_DATA: list = []
+_active_session_id: str  = SESSION_ID
+_posted_today: set        = set()
+_posted_date: str         = ""
+_notified_orders: set     = set()
+SUPPLIER_DATA: list       = []
+BARCODE_SUPPLIER_MAP: dict = {}  # sz... barkod → tedarikçi adı
 
 # ─── Tedarikçi verisi ────────────────────────────────────────────────────────
 
 def load_supplier_data():
-    global SUPPLIER_DATA
+    global SUPPLIER_DATA, BARCODE_SUPPLIER_MAP
     try:
+        # JSON'u yükle — model_kodu-beden formatındaki barkodlar
         with open(SUPPLIER_JSON, "r", encoding="utf-8") as f:
             SUPPLIER_DATA = json.load(f)
-        log.info(f"Tedarikçi verisi yüklendi: {len(SUPPLIER_DATA)} ürün")
+
+        # model_kodu-beden (küçük harf) → tedarikçi haritası
+        model_map = {}
+        for item in SUPPLIER_DATA:
+            barkod    = str(item.get("barkod", "")).strip()
+            tedarikci = str(item.get("tedarikci_adi", "")).strip()
+            if barkod and tedarikci:
+                model_map[barkod.lower()] = tedarikci
+
+        # Excel'den sz barkod → model_kodu-beden eşleştirmesi yap
+        df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
+        count = 0
+        for _, row in df.iterrows():
+            sz_barkod = str(row.get("Barkod", "")).strip()
+            model     = str(row.get("Model Kodu", "")).strip()
+            beden     = str(row.get("Beden", "")).strip()
+            key       = f"{model}-{beden}".lower()
+            tedarikci = model_map.get(key, "")
+            if sz_barkod and tedarikci:
+                BARCODE_SUPPLIER_MAP[sz_barkod] = tedarikci
+                count += 1
+
+        log.info(f"Tedarikçi haritası: {count} barkod eşleştirildi (JSON: {len(SUPPLIER_DATA)} kayıt)")
     except Exception as e:
         log.error(f"Tedarikçi verisi yüklenemedi: {e}")
 
 
 def match_supplier(barcode: str) -> str:
-    """Barkod üzerinden tedarikçi adını döndürür."""
-    if not SUPPLIER_DATA or not isinstance(SUPPLIER_DATA, list):
-        return ""
-    for item in SUPPLIER_DATA:
-        if str(item.get("barkod", "")) == str(barcode):
-            return item.get("tedarikci_adi", "")
-    return ""
+    return BARCODE_SUPPLIER_MAP.get(str(barcode).strip(), "")
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
@@ -144,7 +162,7 @@ async def ask_claude(user_text: str) -> str:
     if r.status_code not in (200, 201):
         return f"❌ Agent'a mesaj gönderilemedi: {r.status_code}"
 
-    deadline = time.time() + POLL_TIMEOUT
+    deadline   = time.time() + POLL_TIMEOUT
     last_count = 0
 
     while time.time() < deadline:
@@ -160,15 +178,12 @@ async def ask_claude(user_text: str) -> str:
         if r.status_code != 200:
             continue
 
-        data = r.json()
+        data   = r.json()
         events = data.get("events", data.get("data", []))
         if len(events) != last_count:
             last_count = len(events)
 
-        status_events = [
-            e for e in events
-            if e.get("type") in ("session.status_idle", "session.status_running")
-        ]
+        status_events = [e for e in events if e.get("type") in ("session.status_idle", "session.status_running")]
         if status_events:
             last = status_events[-1]
             if last.get("type") == "session.status_idle":
@@ -203,19 +218,15 @@ def get_trendyol_headers() -> dict:
 
 
 async def fetch_new_orders() -> list:
-    """Son 30 dakikanın Created siparişlerini çeker."""
     end_ms   = int(datetime.now().timestamp() * 1000)
     start_ms = int((datetime.now() - timedelta(minutes=30)).timestamp() * 1000)
 
-    url = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
+    url    = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
     params = {
-        "startDate":        start_ms,
-        "endDate":          end_ms,
-        "size":             50,
-        "page":             0,
-        "orderByField":     "OrderDate",
-        "orderByDirection": "DESC",
-        "status":           "Created",
+        "startDate": start_ms, "endDate": end_ms,
+        "size": 50, "page": 0,
+        "orderByField": "OrderDate", "orderByDirection": "DESC",
+        "status": "Created",
     }
 
     try:
@@ -231,7 +242,6 @@ async def fetch_new_orders() -> list:
 
 
 async def check_new_orders():
-    """Her 5 dakikada çalışır — yeni siparişleri tedarikçilere bildirir."""
     global _notified_orders
 
     if not TRENDYOL_API_KEY or not TRENDYOL_API_SECRET:
@@ -246,8 +256,7 @@ async def check_new_orders():
         if not order_id or order_id in _notified_orders:
             continue
 
-        lines = order.get("lines", [])
-        for line in lines:
+        for line in order.get("lines", []):
             product_name = line.get("productName", "")
             barcode      = line.get("barcode", "")
             quantity     = line.get("quantity", 1)
@@ -285,10 +294,7 @@ async def upload_to_imgbb(image_url: str) -> str:
             if r.status_code != 200:
                 return ""
             image_data = base64.b64encode(r.content).decode("utf-8")
-            r = await client.post(
-                IMGBB_BASE,
-                data={"key": IMGBB_API_KEY, "image": image_data},
-            )
+            r = await client.post(IMGBB_BASE, data={"key": IMGBB_API_KEY, "image": image_data})
             result = r.json()
             if result.get("success"):
                 return result["data"]["url"]
@@ -322,7 +328,7 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
         )
         carousel = r.json()
         if "id" not in carousel:
-            log.error(f"Carousel container hatası: {r.status_code} {r.text}")
+            log.error(f"Carousel hatası: {r.status_code} {r.text}")
             return {"error": str(carousel)}
 
         await asyncio.sleep(15)
@@ -343,7 +349,7 @@ async def instagram_reels_post(video_url: str, caption: str) -> dict:
             params={"media_type": "REELS", "video_url": video_url, "caption": caption, "access_token": META_ACCESS_TOKEN},
         )
         if r.status_code != 200:
-            log.error(f"Instagram Reels container hatası: {r.status_code} {r.text}")
+            log.error(f"Reels container hatası: {r.status_code} {r.text}")
             return {"error": r.text}
 
         data = r.json()
@@ -357,7 +363,7 @@ async def instagram_reels_post(video_url: str, caption: str) -> dict:
             params={"creation_id": data["id"], "access_token": META_ACCESS_TOKEN},
         )
         if r.status_code != 200:
-            log.error(f"Instagram Reels publish hatası: {r.status_code} {r.text}")
+            log.error(f"Reels publish hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -368,7 +374,7 @@ async def instagram_story_post(image_url: str) -> dict:
             params={"media_type": "STORIES", "image_url": image_url, "access_token": META_ACCESS_TOKEN},
         )
         if r.status_code != 200:
-            log.error(f"Instagram Story container hatası: {r.status_code} {r.text}")
+            log.error(f"Story container hatası: {r.status_code} {r.text}")
             return {"error": r.text}
 
         data = r.json()
@@ -382,7 +388,7 @@ async def instagram_story_post(image_url: str) -> dict:
             params={"creation_id": data["id"], "access_token": META_ACCESS_TOKEN},
         )
         if r.status_code != 200:
-            log.error(f"Instagram Story publish hatası: {r.status_code} {r.text}")
+            log.error(f"Story publish hatası: {r.status_code} {r.text}")
         return r.json()
 
 # ─── Facebook API ────────────────────────────────────────────────────────────
