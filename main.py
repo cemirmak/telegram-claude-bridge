@@ -3,10 +3,10 @@ Telegram → Claude Managed Agents köprüsü
 Render.com'da çalışır (FastAPI + httpx + APScheduler)
 
 Zamanlama (TR saati):
-  Her 5 dakika              → Trendyol yeni sipariş kontrolü + tedarikçi bildirimi
+  Her 5 dakika               → Trendyol yeni sipariş kontrolü + tedarikçi bildirimi
   09:00, 12:00, 16:00, 21:00 → Carousel post (Instagram + Facebook)
-  10:30, 19:00              → Reels (sadece Instagram)
-  14:00, 23:00              → Story (Instagram + Facebook)
+  10:30, 19:00               → Reels (sadece Instagram)
+  14:00, 23:00               → Story (Instagram + Facebook)
 """
 
 import os, asyncio, logging, time, base64, json, re, io
@@ -41,14 +41,13 @@ TRENDYOL_SUPPLIER_ID = os.environ.get("TRENDYOL_SUPPLIER_ID", "1075171")
 
 # Tedarikçi Telegram chat ID'leri
 SUPPLIER_CHAT_IDS = {
-    "Yusuf Cem":      int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
-    "Cem Irmak":      int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
-    "VOLKAN KARASU":  int(os.environ.get("VOLKAN_CHAT_ID", "7031711634")),
-    "Volkan Karasu":  int(os.environ.get("VOLKAN_CHAT_ID", "7031711634")),
-    "Özer Denim":     int(os.environ.get("OZER_CHAT_ID", "6868801554")),
+    "Yusuf Cem":     int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    "Cem Irmak":     int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    "VOLKAN KARASU": int(os.environ.get("VOLKAN_CHAT_ID", "7031711634")),
+    "Volkan Karasu": int(os.environ.get("VOLKAN_CHAT_ID", "7031711634")),
+    "Özer Denim":    int(os.environ.get("OZER_CHAT_ID", "6868801554")),
 }
 
-# Tedarikçi bazlı kısıtlama — sadece kendi ürünlerini görecekler
 RESTRICTED_SUPPLIERS = {"Özer Denim"}
 
 CLAUDE_BASE   = "https://api.anthropic.com"
@@ -72,21 +71,20 @@ SUPPLIER_JSON = "tedarikci-eslesme.json"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-_active_session_id: str    = SESSION_ID
-_posted_today: set          = set()
-_posted_date: str           = ""
-_notified_orders: set       = set()
-SUPPLIER_DATA: list         = []
-BARCODE_SUPPLIER_MAP: dict  = {}
-BARCODE_IMAGE_MAP: dict     = {}
-CHAT_SUPPLIER_MAP: dict     = {}  # chat_id → tedarikçi adı (kısıtlı erişim için)
+_active_session_id: str   = SESSION_ID
+_posted_today: set         = set()
+_posted_date: str          = ""
+_notified_orders: set      = set()
+SUPPLIER_DATA: list        = []
+BARCODE_SUPPLIER_MAP: dict = {}
+BARCODE_IMAGE_MAP: dict    = {}
+CHAT_SUPPLIER_MAP: dict    = {}
 
 # ─── Tedarikçi ve görsel verisi ──────────────────────────────────────────────
 
 def load_supplier_data():
     global SUPPLIER_DATA, BARCODE_SUPPLIER_MAP, BARCODE_IMAGE_MAP, CHAT_SUPPLIER_MAP
 
-    # chat_id → tedarikçi adı haritası (ters çevirme)
     for name, chat_id in SUPPLIER_CHAT_IDS.items():
         if name in RESTRICTED_SUPPLIERS:
             CHAT_SUPPLIER_MAP[chat_id] = name
@@ -133,8 +131,73 @@ def get_product_image(barcode: str) -> str:
 
 
 def get_supplier_for_chat(chat_id: int) -> str:
-    """Kısıtlı tedarikçi mi? Evet ise adını döndür, hayır ise boş."""
     return CHAT_SUPPLIER_MAP.get(chat_id, "")
+
+# ─── Ürün durum sorguları ────────────────────────────────────────────────────
+
+def get_passive_products() -> str:
+    """Excel'den pasif ürünleri listeler."""
+    try:
+        df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
+        if "Durum" not in df.columns:
+            return "❌ Excel'de 'Durum' kolonu bulunamadı."
+
+        passive = df[df["Durum"].astype(str).str.lower().isin(["pasif", "passive", "0", "false"])]
+        passive = passive.drop_duplicates(subset=["Model Kodu"])
+
+        if passive.empty:
+            return "✅ Pasif ürün bulunmuyor."
+
+        lines = [f"📦 *Pasif Ürünler* ({len(passive)} adet)\n"]
+        for _, row in passive.iterrows():
+            lines.append(f"• {row['Ürün Adı'][:60]}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Hata: {e}"
+
+
+def get_stopped_products() -> str:
+    """Excel'den satışı durdurulan ürünleri ve açıklamalarını listeler."""
+    try:
+        df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
+        if "Durum" not in df.columns:
+            return "❌ Excel'de 'Durum' kolonu bulunamadı."
+
+        aciklama_col = "Durum Açıklaması" if "Durum Açıklaması" in df.columns else None
+
+        stopped = df[
+            df["Durum"].astype(str).str.lower().isin(["pasif", "passive", "0", "false"]) |
+            (df["Durum Açıklaması"].astype(str).str.len() > 2 if aciklama_col else False)
+        ]
+        stopped = stopped.drop_duplicates(subset=["Model Kodu"])
+
+        if aciklama_col:
+            stopped = stopped[stopped["Durum Açıklaması"].astype(str).str.strip().str.len() > 2]
+
+        if stopped.empty:
+            return "✅ Satışı durdurulan ürün bulunmuyor."
+
+        lines = [f"🚫 *Satışı Durdurulan Ürünler* ({len(stopped)} adet)\n"]
+        for _, row in stopped.iterrows():
+            aciklama = str(row.get("Durum Açıklaması", "")).strip() if aciklama_col else "—"
+            if not aciklama or aciklama in ("nan", "None", ""):
+                aciklama = "Açıklama yok"
+            lines.append(f"• *{row['Ürün Adı'][:55]}*\n  📝 Sebep: {aciklama}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Hata: {e}"
+
+
+def is_passive_products_request(text: str) -> bool:
+    keywords = ["pasif ürün", "pasif", "aktif değil", "yayında olmayan"]
+    return any(kw in text.lower() for kw in keywords)
+
+
+def is_stopped_products_request(text: str) -> bool:
+    keywords = ["satışı durdur", "satışı durdurul", "durdurulmuş", "satıştan kaldır", "satıştan kaldırıl"]
+    return any(kw in text.lower() for kw in keywords)
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
@@ -261,7 +324,6 @@ async def fetch_orders(days: int = 1, supplier_filter: str = "") -> list:
             content     = data.get("content", [])
             total_pages = data.get("totalPages", 1)
 
-            # Tedarikçi filtresi
             if supplier_filter:
                 filtered = []
                 for order in content:
@@ -310,26 +372,13 @@ async def fetch_new_orders() -> list:
 # ─── Kâr hesabı ─────────────────────────────────────────────────────────────
 
 def calculate_profit(total_amount: float, total_orders: int, total_qty: int) -> dict:
-    """
-    Hesaplama:
-    1. Brüt Kâr = Toplam Satış - Komisyon(%21.5) - Kargo(60₺ × sipariş)
-    2. Maliyet Sonrası = Brüt Kâr × %45  (maliyet %55 olarak düşülür, gösterilmez)
-    3. KDV = Maliyet Sonrası × %10
-    4. Net Kâr = Maliyet Sonrası - KDV
-    """
-    komisyon   = total_amount * 0.215
-    kargo      = total_orders * 60
-    brut_kar   = total_amount - komisyon - kargo
-    ms_kar     = brut_kar * 0.45   # maliyet sonrası (%55 maliyet düşüldü)
-    kdv        = ms_kar * 0.10
-    net_kar    = ms_kar - kdv
-
-    return {
-        "komisyon": komisyon,
-        "kargo":    kargo,
-        "kdv":      kdv,
-        "net_kar":  net_kar,
-    }
+    komisyon = total_amount * 0.215
+    kargo    = total_orders * 60
+    brut_kar = total_amount - komisyon - kargo
+    ms_kar   = brut_kar * 0.45
+    kdv      = ms_kar * 0.10
+    net_kar  = ms_kar - kdv
+    return {"komisyon": komisyon, "kargo": kargo, "kdv": kdv, "net_kar": net_kar}
 
 # ─── Rapor oluşturma ─────────────────────────────────────────────────────────
 
@@ -338,9 +387,9 @@ def summarize_orders(orders: list, days: int, supplier_filter: str = "") -> str:
         prefix = f"*{supplier_filter}* için " if supplier_filter else ""
         return f"Son {days} günde {prefix}hiç sipariş bulunamadı."
 
-    total_amount   = 0.0
-    total_qty      = 0
-    total_orders   = len(orders)
+    total_amount = 0.0
+    total_qty    = 0
+    total_orders = len(orders)
     supplier_stats: dict = {}
     product_stats: dict  = {}
     cancelled = 0
@@ -485,7 +534,13 @@ def extract_days(text: str) -> int:
 
 
 def is_order_report_request(text: str) -> bool:
-    keywords = ["sipariş", "satış", "rapor", "özet", "kazanç", "kâr", "gelir", "ciro", "kaç sipariş", "kaç satış"]
+    # İptal/iade/pasif sorguları agent'a gitsin
+    exclude = ["iptal", "iade", "neden", "sebep", "müşteri", "şikayet",
+               "pasif", "durdurul", "durdur", "kaldırıl"]
+    if any(kw in text.lower() for kw in exclude):
+        return False
+    keywords = ["sipariş", "satış", "rapor", "özet", "kazanç", "kâr",
+                "gelir", "ciro", "kaç sipariş", "kaç satış"]
     return any(kw in text.lower() for kw in keywords)
 
 
@@ -511,7 +566,8 @@ async def send_photo_to_telegram(chat_id: int, photo_url: str, caption: str) -> 
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 f"{TELEGRAM_BASE}/sendPhoto",
-                json={"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "Markdown"},
+                json={"chat_id": chat_id, "photo": photo_url,
+                      "caption": caption, "parse_mode": "Markdown"},
             )
         return r.status_code == 200
     except Exception as e:
@@ -578,8 +634,6 @@ Lütfen hazırlayınız ✅"""
             else:
                 await send_telegram_to(chat_id, caption)
 
-            log.info(f"Bildirim → {supplier}: {product_name} ({size})")
-
         _notified_orders.add(order_id)
         if len(_notified_orders) > 1000:
             _notified_orders = set(list(_notified_orders)[-500:])
@@ -621,7 +675,8 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
 
         r = await client.post(
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
-            params={"media_type": "CAROUSEL", "children": ",".join(container_ids), "caption": caption, "access_token": META_ACCESS_TOKEN},
+            params={"media_type": "CAROUSEL", "children": ",".join(container_ids),
+                    "caption": caption, "access_token": META_ACCESS_TOKEN},
         )
         carousel = r.json()
         if "id" not in carousel:
@@ -640,7 +695,8 @@ async def instagram_reels_post(video_url: str, caption: str) -> dict:
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
-            params={"media_type": "REELS", "video_url": video_url, "caption": caption, "access_token": META_ACCESS_TOKEN},
+            params={"media_type": "REELS", "video_url": video_url,
+                    "caption": caption, "access_token": META_ACCESS_TOKEN},
         )
         if r.status_code != 200:
             return {"error": r.text}
@@ -892,7 +948,7 @@ async def send_telegram(chat_id: int, text: str) -> None:
 async def handle_order_report(chat_id: int, text: str) -> None:
     days            = extract_days(text)
     want_excel      = is_excel_request(text)
-    supplier_filter = get_supplier_for_chat(chat_id)  # kısıtlı tedarikçi mi?
+    supplier_filter = get_supplier_for_chat(chat_id)
 
     await send_telegram(chat_id, f"⏳ Son {days} günlük gerçek veriler çekiliyor...")
     orders = await fetch_orders(days, supplier_filter)
@@ -909,16 +965,31 @@ async def handle_order_report(chat_id: int, text: str) -> None:
 
 async def handle_message(chat_id: int, text: str) -> None:
     try:
+        # Pasif ürün sorgusu
+        if is_passive_products_request(text):
+            await send_telegram(chat_id, get_passive_products())
+            return
+
+        # Satışı durdurulan ürün sorgusu
+        if is_stopped_products_request(text):
+            await send_telegram(chat_id, get_stopped_products())
+            return
+
+        # Sipariş raporu
         if is_order_report_request(text):
             await handle_order_report(chat_id, text)
-        else:
-            # Kısıtlı tedarikçi agent'a yönlendirme yapmasın
-            supplier_filter = get_supplier_for_chat(chat_id)
-            if supplier_filter:
-                await send_telegram(chat_id, "⚠️ Sadece sipariş ve satış raporları için komut gönderebilirsiniz.")
-                return
-            reply = await ask_claude(text)
-            await send_telegram(chat_id, reply)
+            return
+
+        # Kısıtlı tedarikçi → agent'a yönlendirme yapma
+        supplier_filter = get_supplier_for_chat(chat_id)
+        if supplier_filter:
+            await send_telegram(chat_id, "⚠️ Sadece sipariş ve satış raporları için komut gönderebilirsiniz.")
+            return
+
+        # Agent'a gönder
+        reply = await ask_claude(text)
+        await send_telegram(chat_id, reply)
+
     except Exception as exc:
         log.exception("handle_message hatası")
         await send_telegram(chat_id, f"❌ Beklenmedik hata: {exc}")
@@ -937,18 +1008,14 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.error(f"Session başlatılamadı: {exc}")
 
-    # Carousel: 09:00, 12:00, 16:00, 21:00
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=9,  minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=12, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=16, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=21, minute=0))
-    # Reels: 10:30, 19:00
     scheduler.add_job(scheduled_reels,    CronTrigger(hour=10, minute=30))
     scheduler.add_job(scheduled_reels,    CronTrigger(hour=19, minute=0))
-    # Story: 14:00, 23:00
     scheduler.add_job(scheduled_story,    CronTrigger(hour=14, minute=0))
     scheduler.add_job(scheduled_story,    CronTrigger(hour=23, minute=0))
-    # Sipariş kontrolü: her 5 dakika
     scheduler.add_job(check_new_orders,   IntervalTrigger(minutes=5))
 
     scheduler.start()
