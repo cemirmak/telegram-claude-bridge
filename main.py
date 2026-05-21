@@ -41,8 +41,8 @@ TRENDYOL_SUPPLIER_ID = os.environ.get("TRENDYOL_SUPPLIER_ID", "1075171")
 
 # Tedarikçi Telegram chat ID'leri
 SUPPLIER_CHAT_IDS = {
-    "Yusuf Cem":    int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
-    "Cem Irmak":    int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    "Yusuf Cem":  int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    "Cem Irmak":  int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
     # Sonradan eklenecek:
     # "VOLKAN KARASU": int(os.environ.get("VOLKAN_CHAT_ID", "0")),
     # "Özer Denim":    int(os.environ.get("OZER_CHAT_ID", "0")),
@@ -73,7 +73,7 @@ _active_session_id: str = SESSION_ID
 _posted_today: set = set()
 _posted_date: str = ""
 _notified_orders: set = set()
-SUPPLIER_DATA: dict = {}
+SUPPLIER_DATA: list = []
 
 # ─── Tedarikçi verisi ────────────────────────────────────────────────────────
 
@@ -82,28 +82,19 @@ def load_supplier_data():
     try:
         with open(SUPPLIER_JSON, "r", encoding="utf-8") as f:
             SUPPLIER_DATA = json.load(f)
-        log.info(f"Tedarikçi verisi yüklendi: {len(SUPPLIER_DATA.get('product_costs', {}))} ürün")
+        log.info(f"Tedarikçi verisi yüklendi: {len(SUPPLIER_DATA)} ürün")
     except Exception as e:
         log.error(f"Tedarikçi verisi yüklenemedi: {e}")
 
 
 def match_supplier(barcode: str) -> str:
     """Barkod üzerinden tedarikçi adını döndürür."""
-    costs     = SUPPLIER_DATA.get("product_costs", {})
-    suppliers = SUPPLIER_DATA.get("suppliers", {})
-
-    entry = costs.get(str(barcode))
-    if not entry:
-        for key, val in costs.items():
-            if str(barcode) in key or key in str(barcode):
-                entry = val
-                break
-
-    if not entry or not entry.get("supplierId"):
+    if not SUPPLIER_DATA or not isinstance(SUPPLIER_DATA, list):
         return ""
-
-    supplier = suppliers.get(entry["supplierId"], {})
-    return supplier.get("name", "")
+    for item in SUPPLIER_DATA:
+        if str(item.get("barkod", "")) == str(barcode):
+            return item.get("tedarikci_adi", "")
+    return ""
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
@@ -265,6 +256,8 @@ async def check_new_orders():
 
             supplier = match_supplier(barcode)
             chat_id  = SUPPLIER_CHAT_IDS.get(supplier, 0)
+
+            log.info(f"Sipariş: {product_name} | Barkod: {barcode} | Tedarikçi: {supplier or 'bulunamadı'}")
 
             if chat_id:
                 msg = f"""🛍 *Yeni Sipariş!*
@@ -644,7 +637,6 @@ scheduler = AsyncIOScheduler(timezone="Europe/Istanbul")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Tedarikçi verisini yükle
     load_supplier_data()
 
     try:
@@ -653,15 +645,12 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.error(f"Session başlatılamadı: {exc}")
 
-    # Sosyal medya
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=10, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=14, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=20, minute=0))
     scheduler.add_job(scheduled_reels,    CronTrigger(hour=20, minute=30))
     scheduler.add_job(scheduled_story,    CronTrigger(hour=0,  minute=0))
-
-    # Trendyol sipariş kontrolü — her 5 dakika
-    scheduler.add_job(check_new_orders, IntervalTrigger(minutes=5))
+    scheduler.add_job(check_new_orders,   IntervalTrigger(minutes=5))
 
     scheduler.start()
     log.info("⏰ Carousel 10:00/14:00/20:00 | Reels 20:30 | Story 00:00 | Sipariş her 5dk (TR)")
