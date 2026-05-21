@@ -9,7 +9,7 @@ Zamanlama (TR saati):
   00:00                → Story (Instagram + Facebook)
 """
 
-import os, asyncio, logging, time, base64, json
+import os, asyncio, logging, time, base64, json, re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
@@ -43,9 +43,6 @@ TRENDYOL_SUPPLIER_ID = os.environ.get("TRENDYOL_SUPPLIER_ID", "1075171")
 SUPPLIER_CHAT_IDS = {
     "Yusuf Cem":  int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
     "Cem Irmak":  int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
-    # Sonradan eklenecek:
-    # "VOLKAN KARASU": int(os.environ.get("VOLKAN_CHAT_ID", "0")),
-    # "Özer Denim":    int(os.environ.get("OZER_CHAT_ID", "0")),
 }
 
 CLAUDE_BASE   = "https://api.anthropic.com"
@@ -69,23 +66,21 @@ SUPPLIER_JSON = "tedarikci-eslesme.json"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-_active_session_id: str  = SESSION_ID
-_posted_today: set        = set()
-_posted_date: str         = ""
-_notified_orders: set     = set()
-SUPPLIER_DATA: list       = []
-BARCODE_SUPPLIER_MAP: dict = {}  # sz... barkod → tedarikçi adı
+_active_session_id: str   = SESSION_ID
+_posted_today: set         = set()
+_posted_date: str          = ""
+_notified_orders: set      = set()
+SUPPLIER_DATA: list        = []
+BARCODE_SUPPLIER_MAP: dict = {}
 
 # ─── Tedarikçi verisi ────────────────────────────────────────────────────────
 
 def load_supplier_data():
     global SUPPLIER_DATA, BARCODE_SUPPLIER_MAP
     try:
-        # JSON'u yükle — model_kodu-beden formatındaki barkodlar
         with open(SUPPLIER_JSON, "r", encoding="utf-8") as f:
             SUPPLIER_DATA = json.load(f)
 
-        # model_kodu-beden (küçük harf) → tedarikçi haritası
         model_map = {}
         for item in SUPPLIER_DATA:
             barkod    = str(item.get("barkod", "")).strip()
@@ -93,7 +88,6 @@ def load_supplier_data():
             if barkod and tedarikci:
                 model_map[barkod.lower()] = tedarikci
 
-        # Excel'den sz barkod → model_kodu-beden eşleştirmesi yap
         df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
         count = 0
         for _, row in df.iterrows():
@@ -217,7 +211,43 @@ def get_trendyol_headers() -> dict:
     }
 
 
+async def fetch_orders(days: int = 1) -> list:
+    """Belirtilen gün sayısı kadar geriye gidip siparişleri çeker."""
+    end_ms   = int(datetime.now().timestamp() * 1000)
+    start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+
+    url    = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
+    all_orders = []
+    page = 0
+
+    while True:
+        params = {
+            "startDate": start_ms, "endDate": end_ms,
+            "size": 200, "page": page,
+            "orderByField": "OrderDate", "orderByDirection": "DESC",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get(url, headers=get_trendyol_headers(), params=params)
+            if r.status_code != 200:
+                log.warning(f"Trendyol hata: {r.status_code}")
+                break
+            data        = r.json()
+            content     = data.get("content", [])
+            total_pages = data.get("totalPages", 1)
+            all_orders.extend(content)
+            if page >= total_pages - 1 or not content:
+                break
+            page += 1
+        except Exception as e:
+            log.error(f"Trendyol fetch hatası: {e}")
+            break
+
+    return all_orders
+
+
 async def fetch_new_orders() -> list:
+    """Son 30 dakikanın Created siparişlerini çeker."""
     end_ms   = int(datetime.now().timestamp() * 1000)
     start_ms = int((datetime.now() - timedelta(minutes=30)).timestamp() * 1000)
 
@@ -228,18 +258,116 @@ async def fetch_new_orders() -> list:
         "orderByField": "OrderDate", "orderByDirection": "DESC",
         "status": "Created",
     }
-
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(url, headers=get_trendyol_headers(), params=params)
         if r.status_code != 200:
-            log.warning(f"Trendyol sipariş hatası: {r.status_code} {r.text[:200]}")
             return []
         return r.json().get("content", [])
     except Exception as e:
         log.error(f"Trendyol fetch hatası: {e}")
         return []
 
+
+def summarize_orders(orders: list, days: int) -> str:
+    """Sipariş listesinden özet metin üretir."""
+    if not orders:
+        return f"Son {days} günde hiç sipariş bulunamadı."
+
+    total_amount   = 0.0
+    total_qty      = 0
+    supplier_stats: dict = {}
+    product_stats: dict  = {}
+    cancelled      = 0
+    returned       = 0
+
+    for order in orders:
+        status = order.get("status", "")
+        if status in ("Cancelled",):
+            cancelled += 1
+        if status in ("Returned", "UnDelivered"):
+            returned += 1
+
+        for line in order.get("lines", []):
+            qty    = line.get("quantity", 1)
+            amount = line.get("lineGrossAmount", line.get("amount", 0))
+            name   = line.get("productName", "")
+            barkod = line.get("barcode", "")
+
+            total_amount += amount
+            total_qty    += qty
+
+            supplier = match_supplier(barkod) or "Diğer"
+            if supplier not in supplier_stats:
+                supplier_stats[supplier] = {"qty": 0, "amount": 0.0}
+            supplier_stats[supplier]["qty"]    += qty
+            supplier_stats[supplier]["amount"] += amount
+
+            if name not in product_stats:
+                product_stats[name] = {"qty": 0, "amount": 0.0}
+            product_stats[name]["qty"]    += qty
+            product_stats[name]["amount"] += amount
+
+    # Tedarikçi tablosu
+    supplier_lines = []
+    for sup, stats in sorted(supplier_stats.items(), key=lambda x: x[1]["amount"], reverse=True):
+        pay = (stats["amount"] / total_amount * 100) if total_amount else 0
+        supplier_lines.append(f"  • {sup}: {stats['qty']} adet | {stats['amount']:.2f}₺ (%{pay:.0f})")
+
+    # En çok satan 5 ürün
+    top5 = sorted(product_stats.items(), key=lambda x: x[1]["qty"], reverse=True)[:5]
+    top5_lines = [f"  {i+1}. {name[:45]} → {s['qty']} adet | {s['amount']:.2f}₺"
+                  for i, (name, s) in enumerate(top5)]
+
+    komisyon = total_amount * 0.215
+    net_kar  = total_amount - komisyon - (total_qty * 27.5)
+
+    summary = f"""📊 *Son {days} Günlük Sipariş Özeti*
+_{datetime.now().strftime('%d.%m.%Y %H:%M')}_
+
+💰 *Finansal*
+• Toplam Sipariş: {len(orders)} paket
+• Toplam Satış: {total_amount:.2f}₺
+• Trendyol Komisyonu (%21.5): -{komisyon:.2f}₺
+• Tahmini Net Kâr: {net_kar:.2f}₺
+• İade/İptal: {returned + cancelled} adet
+
+👥 *Tedarikçi Bazlı*
+{chr(10).join(supplier_lines)}
+
+🏆 *En Çok Satan 5 Ürün*
+{chr(10).join(top5_lines)}
+
+_✅ Gerçek Trendyol verisi_"""
+
+    return summary
+
+
+def extract_days(text: str) -> int:
+    """Kullanıcı mesajından gün sayısını çıkarır."""
+    text = text.lower()
+    if "bugün" in text or "bugünkü" in text:
+        return 1
+    if "bu hafta" in text or "haftalık" in text:
+        return 7
+    if "bu ay" in text or "aylık" in text:
+        return 30
+    match = re.search(r"(\d+)\s*gün", text)
+    if match:
+        return min(int(match.group(1)), 30)
+    return 3  # varsayılan
+
+
+def is_order_report_request(text: str) -> bool:
+    """Kullanıcı sipariş raporu mu istiyor?"""
+    keywords = [
+        "sipariş", "satış", "rapor", "özet", "kazanç",
+        "kâr", "gelir", "ciro", "kaç sipariş", "kaç satış"
+    ]
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in keywords)
+
+# ─── Sipariş kontrolü (her 5 dk) ────────────────────────────────────────────
 
 async def check_new_orders():
     global _notified_orders
@@ -629,13 +757,28 @@ async def send_telegram_to(chat_id: int, text: str) -> None:
 async def send_telegram(chat_id: int, text: str) -> None:
     await send_telegram_to(chat_id, text)
 
+
+async def handle_order_report(chat_id: int, text: str) -> None:
+    """Gerçek Trendyol verisinden sipariş özeti oluşturur."""
+    days = extract_days(text)
+    await send_telegram(chat_id, f"⏳ Son {days} günlük gerçek veriler çekiliyor...")
+
+    orders = await fetch_orders(days)
+    summary = summarize_orders(orders, days)
+    await send_telegram(chat_id, summary)
+
+
 async def handle_message(chat_id: int, text: str) -> None:
     try:
-        reply = await ask_claude(text)
+        # Sipariş/satış raporu isteği mi?
+        if is_order_report_request(text):
+            await handle_order_report(chat_id, text)
+        else:
+            reply = await ask_claude(text)
+            await send_telegram(chat_id, reply)
     except Exception as exc:
-        log.exception("ask_claude hatası")
-        reply = f"❌ Beklenmedik hata: {exc}"
-    await send_telegram(chat_id, reply)
+        log.exception("handle_message hatası")
+        await send_telegram(chat_id, f"❌ Beklenmedik hata: {exc}")
 
 # ─── FastAPI ────────────────────────────────────────────────────────────────
 
