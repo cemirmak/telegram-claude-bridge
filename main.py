@@ -3,11 +3,14 @@ Telegram → Claude Managed Agents köprüsü
 Render.com'da çalışır (FastAPI + httpx)
 
 Ortam değişkenleri (Render.com Environment):
-  CLAUDE_API_KEY     — Anthropic API anahtarı
-  TELEGRAM_TOKEN     — Telegram bot token (@BotFather)
-  AGENT_ID           — agent_01TStkKvFmCiGM7cVXtnmypB
-  SESSION_ID         — sesn_01PWp9mY32e5pijw4XAt82f7  (opsiyonel; yoksa yeni session açılır)
-  ENV_ID             — env_01EhVfhGqqc9yytZZE3ieaSb
+  CLAUDE_API_KEY        — Anthropic API anahtarı
+  TELEGRAM_TOKEN        — Telegram bot token (@BotFather)
+  AGENT_ID              — agent_01TStkKvFmCiGM7cVXtnmypB
+  SESSION_ID            — sesn_01PWp9mY32e5pijw4XAt82f7
+  ENV_ID                — env_01EhVfhGqqc9yytZZE3ieaSb
+  META_ACCESS_TOKEN     — Meta Graph API token
+  INSTAGRAM_ACCOUNT_ID  — 17841426737963461
+  FACEBOOK_PAGE_ID      — 1048704551666095
 """
 
 import os, asyncio, logging, time
@@ -18,14 +21,18 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 # ─── Yapılandırma ───────────────────────────────────────────────────────────
-CLAUDE_API_KEY  = os.environ["CLAUDE_API_KEY"]
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-AGENT_ID        = os.environ["AGENT_ID"]
-SESSION_ID      = os.environ.get("SESSION_ID", "")
-ENV_ID          = os.environ["ENV_ID"]
+CLAUDE_API_KEY       = os.environ["CLAUDE_API_KEY"]
+TELEGRAM_TOKEN       = os.environ["TELEGRAM_TOKEN"]
+AGENT_ID             = os.environ["AGENT_ID"]
+SESSION_ID           = os.environ.get("SESSION_ID", "")
+ENV_ID               = os.environ["ENV_ID"]
+META_ACCESS_TOKEN    = os.environ.get("META_ACCESS_TOKEN", "")
+INSTAGRAM_ACCOUNT_ID = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
+FACEBOOK_PAGE_ID     = os.environ.get("FACEBOOK_PAGE_ID", "")
 
-CLAUDE_BASE     = "https://api.anthropic.com"
-TELEGRAM_BASE   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+CLAUDE_BASE  = "https://api.anthropic.com"
+TELEGRAM_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+GRAPH_BASE   = "https://graph.facebook.com/v19.0"
 
 CLAUDE_HEADERS = {
     "x-api-key":         CLAUDE_API_KEY,
@@ -35,12 +42,11 @@ CLAUDE_HEADERS = {
 }
 
 POLL_INTERVAL = 2
-POLL_TIMEOUT  = 750
+POLL_TIMEOUT  = 300
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── Global ─────────────────────────────────────────────────────────────────
 _active_session_id: str = SESSION_ID
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
@@ -120,8 +126,6 @@ async def ask_claude(user_text: str) -> str:
             log.info(f"Events: {len(events)} adet")
             last_count = len(events)
 
-        # Son status eventine bak — multiagent yapıda birden fazla idle gelir,
-        # sadece sonuncusu end_turn ise gerçekten bitti demektir
         status_events = [
             e for e in events
             if e.get("type") in ("session.status_idle", "session.status_running")
@@ -152,6 +156,95 @@ def _extract_answer(events: list) -> str:
         return "🤔 Cevap oluşturuldu ama metin bulunamadı."
     parts = [b["text"] for b in msgs[-1].get("content", []) if isinstance(b, dict) and b.get("type") == "text"]
     return "\n".join(parts) if parts else "🤔 Boş cevap."
+
+# ─── Meta Graph API ─────────────────────────────────────────────────────────
+
+async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
+    """Instagram'a çoklu resim (carousel) post atar."""
+    async with httpx.AsyncClient(timeout=30) as client:
+
+        # 1) Her görsel için container oluştur
+        container_ids = []
+        for url in image_urls:
+            r = await client.post(
+                f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
+                params={
+                    "image_url": url,
+                    "is_carousel_item": "true",
+                    "access_token": META_ACCESS_TOKEN,
+                },
+            )
+            data = r.json()
+            if "id" not in data:
+                log.error(f"Görsel container hatası: {data}")
+                return {"error": str(data)}
+            container_ids.append(data["id"])
+
+        # 2) Carousel container oluştur
+        r = await client.post(
+            f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
+            params={
+                "media_type": "CAROUSEL",
+                "children": ",".join(container_ids),
+                "caption": caption,
+                "access_token": META_ACCESS_TOKEN,
+            },
+        )
+        carousel = r.json()
+        if "id" not in carousel:
+            log.error(f"Carousel container hatası: {carousel}")
+            return {"error": str(carousel)}
+
+        # 3) Yayınla
+        r = await client.post(
+            f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
+            params={
+                "creation_id": carousel["id"],
+                "access_token": META_ACCESS_TOKEN,
+            },
+        )
+        result = r.json()
+        log.info(f"Instagram carousel yayınlandı: {result}")
+        return result
+
+
+async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
+    """Facebook sayfasına çoklu resim post atar."""
+    async with httpx.AsyncClient(timeout=30) as client:
+
+        # Her görseli ayrı yükle
+        photo_ids = []
+        for url in image_urls:
+            r = await client.post(
+                f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photos",
+                params={
+                    "url": url,
+                    "published": "false",
+                    "access_token": META_ACCESS_TOKEN,
+                },
+            )
+            data = r.json()
+            if "id" not in data:
+                log.error(f"Facebook foto hatası: {data}")
+                continue
+            photo_ids.append({"media_fbid": data["id"]})
+
+        if not photo_ids:
+            return {"error": "Hiç fotoğraf yüklenemedi"}
+
+        # Hepsini tek post olarak yayınla
+        r = await client.post(
+            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/feed",
+            params={"access_token": META_ACCESS_TOKEN},
+            json={
+                "message": caption,
+                "attached_media": photo_ids,
+            },
+        )
+        result = r.json()
+        log.info(f"Facebook post yayınlandı: {result}")
+        return result
+
 
 # ─── Telegram ───────────────────────────────────────────────────────────────
 
@@ -184,6 +277,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
 @app.post("/webhook")
 async def webhook(request: Request, background: BackgroundTasks):
     body = await request.json()
@@ -206,6 +300,36 @@ async def webhook(request: Request, background: BackgroundTasks):
     background.add_task(handle_message, chat_id, text)
     await send_telegram(chat_id, "⏳ Cevap yazılıyor…")
     return JSONResponse({"ok": True})
+
+
+@app.post("/post-product")
+async def post_product(request: Request):
+    """
+    Agent bu endpoint'i çağırarak ürünü sosyal medyaya paylaşır.
+    Body: {
+        "image_urls": [...],
+        "caption": "...",
+        "platforms": ["instagram", "facebook"]
+    }
+    """
+    body = await request.json()
+    image_urls = body.get("image_urls", [])
+    caption    = body.get("caption", "")
+    platforms  = body.get("platforms", ["instagram", "facebook"])
+
+    if not image_urls or not caption:
+        return JSONResponse({"error": "image_urls ve caption zorunlu"}, status_code=400)
+
+    results = {}
+
+    if "instagram" in platforms:
+        results["instagram"] = await instagram_carousel_post(image_urls, caption)
+
+    if "facebook" in platforms:
+        results["facebook"] = await facebook_carousel_post(image_urls, caption)
+
+    return JSONResponse(results)
+
 
 @app.get("/")
 async def health():
