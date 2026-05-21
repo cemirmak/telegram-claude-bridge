@@ -15,17 +15,17 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 # ─── Yapılandırma ───────────────────────────────────────────────────────────
-CLAUDE_API_KEY       = os.environ["CLAUDE_API_KEY"]
-TELEGRAM_TOKEN       = os.environ["TELEGRAM_TOKEN"]
-AGENT_ID             = os.environ["AGENT_ID"]
-SESSION_ID           = os.environ.get("SESSION_ID", "")
-ENV_ID               = os.environ["ENV_ID"]
-META_ACCESS_TOKEN    = os.environ.get("META_ACCESS_TOKEN", "")      # Instagram token
-FACEBOOK_ACCESS_TOKEN = os.environ.get("FACEBOOK_ACCESS_TOKEN", "") # Facebook token (workflow app)
-INSTAGRAM_ACCOUNT_ID = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
-FACEBOOK_PAGE_ID     = os.environ.get("FACEBOOK_PAGE_ID", "")
-IMGBB_API_KEY        = os.environ.get("IMGBB_API_KEY", "")
-TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
+CLAUDE_API_KEY        = os.environ["CLAUDE_API_KEY"]
+TELEGRAM_TOKEN        = os.environ["TELEGRAM_TOKEN"]
+AGENT_ID              = os.environ["AGENT_ID"]
+SESSION_ID            = os.environ.get("SESSION_ID", "")
+ENV_ID                = os.environ["ENV_ID"]
+META_ACCESS_TOKEN     = os.environ.get("META_ACCESS_TOKEN", "")       # Instagram token
+FACEBOOK_ACCESS_TOKEN = os.environ.get("FACEBOOK_ACCESS_TOKEN", "")  # Facebook Page token
+INSTAGRAM_ACCOUNT_ID  = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
+FACEBOOK_PAGE_ID      = os.environ.get("FACEBOOK_PAGE_ID", "")
+IMGBB_API_KEY         = os.environ.get("IMGBB_API_KEY", "")
+TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 CLAUDE_BASE   = "https://api.anthropic.com"
 TELEGRAM_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -269,6 +269,7 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
                 photo_ids.append({"media_fbid": data["id"]})
             else:
                 log.error(f"Facebook foto hatası: {data}")
+            await asyncio.sleep(1)
 
         if not photo_ids:
             return {"error": "Hiç fotoğraf yüklenemedi"}
@@ -314,10 +315,32 @@ async def facebook_reels_post(video_url: str, caption: str) -> dict:
 
 
 async def facebook_story_post(image_url: str) -> dict:
+    """2 adımlı: önce unpublished yükle, sonra photo_id ile story paylaş."""
     async with httpx.AsyncClient(timeout=60) as client:
+        # Adım 1: Fotoğrafı unpublished yükle
+        r = await client.post(
+            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photos",
+            params={
+                "url": image_url,
+                "published": "false",
+                "access_token": FACEBOOK_ACCESS_TOKEN,
+            },
+        )
+        if r.status_code != 200:
+            log.error(f"Facebook foto yükleme hatası: {r.status_code} {r.text}")
+            return {"error": r.text}
+
+        photo_id = r.json().get("id")
+        if not photo_id:
+            return {"error": "photo_id alınamadı"}
+
+        # Adım 2: photo_id ile story paylaş
         r = await client.post(
             f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photo_stories",
-            params={"url": image_url, "access_token": FACEBOOK_ACCESS_TOKEN},
+            params={
+                "photo_id": photo_id,
+                "access_token": FACEBOOK_ACCESS_TOKEN,
+            },
         )
         if r.status_code != 200:
             log.error(f"Facebook Story hatası: {r.status_code} {r.text}")
