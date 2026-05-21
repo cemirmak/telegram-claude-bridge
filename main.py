@@ -1,18 +1,6 @@
 """
 Telegram → Claude Managed Agents köprüsü
 Render.com'da çalışır (FastAPI + httpx + APScheduler)
-
-Ortam değişkenleri (Render.com Environment):
-  CLAUDE_API_KEY        — Anthropic API anahtarı
-  TELEGRAM_TOKEN        — Telegram bot token (@BotFather)
-  AGENT_ID              — agent_01TStkKvFmCiGM7cVXtnmypB
-  SESSION_ID            — sesn_01PWp9mY32e5pijw4XAt82f7
-  ENV_ID                — env_01EhVfhGqqc9yytZZE3ieaSb
-  META_ACCESS_TOKEN     — Meta Graph API token
-  INSTAGRAM_ACCOUNT_ID  — 17841426737963461
-  FACEBOOK_PAGE_ID      — 1048704551666095
-  IMGBB_API_KEY         — ImgBB API anahtarı
-  TELEGRAM_CHAT_ID      — Bildirim gönderilecek Telegram chat ID
 """
 
 import os, asyncio, logging, time, base64
@@ -202,6 +190,7 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
         )
         carousel = r.json()
         if "id" not in carousel:
+            log.error(f"Carousel container hatası: {r.status_code} {r.text}")
             return {"error": str(carousel)}
 
         await asyncio.sleep(15)
@@ -210,6 +199,8 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
             params={"creation_id": carousel["id"], "access_token": META_ACCESS_TOKEN},
         )
+        if r.status_code != 200:
+            log.error(f"Carousel publish hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -224,6 +215,10 @@ async def instagram_reels_post(video_url: str, caption: str) -> dict:
                 "access_token": META_ACCESS_TOKEN,
             },
         )
+        if r.status_code != 200:
+            log.error(f"Instagram Reels container hatası: {r.status_code} {r.text}")
+            return {"error": r.text}
+
         data = r.json()
         if "id" not in data:
             return {"error": str(data)}
@@ -234,6 +229,8 @@ async def instagram_reels_post(video_url: str, caption: str) -> dict:
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
             params={"creation_id": data["id"], "access_token": META_ACCESS_TOKEN},
         )
+        if r.status_code != 200:
+            log.error(f"Instagram Reels publish hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -243,6 +240,10 @@ async def instagram_story_post(image_url: str) -> dict:
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
             params={"media_type": "STORIES", "image_url": image_url, "access_token": META_ACCESS_TOKEN},
         )
+        if r.status_code != 200:
+            log.error(f"Instagram Story container hatası: {r.status_code} {r.text}")
+            return {"error": r.text}
+
         data = r.json()
         if "id" not in data:
             return {"error": str(data)}
@@ -253,6 +254,8 @@ async def instagram_story_post(image_url: str) -> dict:
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
             params={"creation_id": data["id"], "access_token": META_ACCESS_TOKEN},
         )
+        if r.status_code != 200:
+            log.error(f"Instagram Story publish hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -262,6 +265,10 @@ async def facebook_reels_post(video_url: str, caption: str) -> dict:
             f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
             params={"upload_phase": "start", "access_token": META_ACCESS_TOKEN},
         )
+        if r.status_code != 200:
+            log.error(f"Facebook Reels start hatası: {r.status_code} {r.text}")
+            return {"error": r.text}
+
         data = r.json()
         video_id = data.get("video_id")
         if not video_id:
@@ -277,6 +284,8 @@ async def facebook_reels_post(video_url: str, caption: str) -> dict:
                 "access_token": META_ACCESS_TOKEN,
             },
         )
+        if r.status_code != 200:
+            log.error(f"Facebook Reels finish hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -286,6 +295,8 @@ async def facebook_story_post(image_url: str) -> dict:
             f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photo_stories",
             params={"url": image_url, "access_token": META_ACCESS_TOKEN},
         )
+        if r.status_code != 200:
+            log.error(f"Facebook Story hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -311,6 +322,8 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
             params={"access_token": META_ACCESS_TOKEN},
             json={"message": caption, "attached_media": photo_ids},
         )
+        if r.status_code != 200:
+            log.error(f"Facebook carousel hatası: {r.status_code} {r.text}")
         return r.json()
 
 # ─── Ürün seçimi ────────────────────────────────────────────────────────────
@@ -337,9 +350,8 @@ def pick_product(df: pd.DataFrame, require_video: bool = False) -> dict:
         _posted_today = set()
         available = df
 
-    # Video gerekliyse sadece video URL'si olan ürünleri seç
     if require_video and "Video URL" in df.columns:
-        with_video = available[available["Video URL"].notna() & (available["Video URL"] != "")]
+        with_video = available[available["Video URL"].notna() & (available["Video URL"].astype(str).str.startswith("http"))]
         if not with_video.empty:
             available = with_video
 
@@ -403,17 +415,13 @@ Sadece caption metnini döndür."""
 # ─── Zamanlanmış görevler ───────────────────────────────────────────────────
 
 async def scheduled_carousel():
-    """Günde 3x — 10:00, 14:00, 20:00 — Carousel post."""
     log.info("⏰ Carousel paylaşımı başlıyor...")
-
     df = load_products()
     if df.empty:
         await notify_telegram("❌ Ürün listesi bulunamadı.")
         return
 
     product = pick_product(df)
-    log.info(f"Carousel ürün: {product['name']}")
-
     if not product["image_urls"]:
         return
 
@@ -428,56 +436,46 @@ async def scheduled_carousel():
         return
 
     caption = await generate_caption(product)
-
     ig = await instagram_carousel_post(imgbb_urls, caption)
     fb = await facebook_carousel_post(imgbb_urls, caption)
 
-    ig_ok = "id" in str(ig)
-    fb_ok = "id" in str(fb)
+    ig_ok = "id" in str(ig) and "error" not in ig
+    fb_ok = "id" in str(fb) and "error" not in fb
 
     await notify_telegram(f"📸 *Carousel Post*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'} | FB: {'✅' if fb_ok else '❌'}")
 
 
 async def scheduled_reels():
-    """Günde 1x — 20:30 — Reels video."""
     log.info("⏰ Reels paylaşımı başlıyor...")
-
     df = load_products()
     if df.empty:
         await notify_telegram("❌ Ürün listesi bulunamadı.")
         return
 
     product = pick_product(df, require_video=True)
-
     if not product["video_url"]:
-        log.info("Video URL bulunamadı, Reels atlandı.")
         await notify_telegram("⚠️ Reels: Video URL'si olan ürün bulunamadı.")
         return
 
-    log.info(f"Reels ürün: {product['name']} | Video: {product['video_url']}")
-
+    log.info(f"Reels ürün: {product['name']} | {product['video_url']}")
     caption = await generate_caption(product)
-
     ig = await instagram_reels_post(product["video_url"], caption)
     fb = await facebook_reels_post(product["video_url"], caption)
 
-    ig_ok = "id" in str(ig)
-    fb_ok = "id" in str(fb)
+    ig_ok = "id" in str(ig) and "error" not in ig
+    fb_ok = "id" in str(fb) and "error" not in fb
 
     await notify_telegram(f"🎬 *Reels*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'} | FB: {'✅' if fb_ok else '❌'}")
 
 
 async def scheduled_story():
-    """Günde 1x — 00:00 — Story."""
     log.info("⏰ Story paylaşımı başlıyor...")
-
     df = load_products()
     if df.empty:
         await notify_telegram("❌ Ürün listesi bulunamadı.")
         return
 
     product = pick_product(df)
-
     if not product["image_urls"]:
         return
 
@@ -489,8 +487,8 @@ async def scheduled_story():
     ig = await instagram_story_post(imgbb_url)
     fb = await facebook_story_post(imgbb_url)
 
-    ig_ok = "id" in str(ig)
-    fb_ok = "id" in str(fb)
+    ig_ok = "id" in str(ig) and "error" not in ig
+    fb_ok = "id" in str(fb) and "error" not in fb
 
     await notify_telegram(f"📖 *Story*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'} | FB: {'✅' if fb_ok else '❌'}")
 
@@ -535,17 +533,13 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.error(f"Session başlatılamadı: {exc}")
 
-    # Carousel — 10:00, 14:00, 20:00
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=10, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=14, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=20, minute=0))
-    # Reels — 20:30
-    scheduler.add_job(scheduled_reels, CronTrigger(hour=20, minute=30))
-    # Story — 00:00
-    scheduler.add_job(scheduled_story, CronTrigger(hour=0, minute=0))
-
+    scheduler.add_job(scheduled_reels,    CronTrigger(hour=20, minute=30))
+    scheduler.add_job(scheduled_story,    CronTrigger(hour=0,  minute=0))
     scheduler.start()
-    log.info("⏰ Zamanlayıcı: Carousel 10:00/14:00/20:00 | Reels 20:30 | Story 00:00 (TR)")
+    log.info("⏰ Carousel 10:00/14:00/20:00 | Reels 20:30 | Story 00:00 (TR)")
 
     yield
     scheduler.shutdown()
@@ -575,17 +569,17 @@ async def webhook(request: Request, background: BackgroundTasks):
 
     if text.startswith("/post_now"):
         background.add_task(scheduled_carousel)
-        await send_telegram(chat_id, "📸 Manuel carousel paylaşımı başlatıldı...")
+        await send_telegram(chat_id, "📸 Carousel paylaşımı başlatıldı...")
         return JSONResponse({"ok": True})
 
     if text.startswith("/reels_now"):
         background.add_task(scheduled_reels)
-        await send_telegram(chat_id, "🎬 Manuel Reels paylaşımı başlatıldı...")
+        await send_telegram(chat_id, "🎬 Reels paylaşımı başlatıldı...")
         return JSONResponse({"ok": True})
 
     if text.startswith("/story_now"):
         background.add_task(scheduled_story)
-        await send_telegram(chat_id, "📖 Manuel Story paylaşımı başlatıldı...")
+        await send_telegram(chat_id, "📖 Story paylaşımı başlatıldı...")
         return JSONResponse({"ok": True})
 
     background.add_task(handle_message, chat_id, text)
