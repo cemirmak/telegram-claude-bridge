@@ -117,13 +117,21 @@ async def ask_claude(user_text: str) -> str:
         events = data.get("events", data.get("data", []))
 
         if len(events) != last_count:
-            log.info(f"Events: {len(events)} adet — {[e.get('type') for e in events]}")
+            log.info(f"Events: {len(events)} adet")
             last_count = len(events)
 
-        for ev in events:
-            if ev.get("type") == "session.status_idle":
-                stop = ev.get("stop_reason") or {}
-                if (stop.get("type") if isinstance(stop, dict) else stop) == "end_turn":
+        # Son status eventine bak — multiagent yapıda birden fazla idle gelir,
+        # sadece sonuncusu end_turn ise gerçekten bitti demektir
+        status_events = [
+            e for e in events
+            if e.get("type") in ("session.status_idle", "session.status_running")
+        ]
+        if status_events:
+            last = status_events[-1]
+            if last.get("type") == "session.status_idle":
+                stop = last.get("stop_reason") or {}
+                stop_type = stop.get("type") if isinstance(stop, dict) else stop
+                if stop_type == "end_turn":
                     answer = _extract_answer(events)
                     log.info(f"Cevap alındı ({len(answer)} karakter)")
                     return answer
