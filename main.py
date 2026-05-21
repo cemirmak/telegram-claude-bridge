@@ -267,10 +267,10 @@ async def fetch_new_orders() -> list:
 
 
 def build_excel(orders: list, days: int) -> bytes:
-    """Sipariş listesinden Excel dosyası oluşturur, bytes döndürür."""
+    """Sipariş listesinden 3 sayfalı Excel oluşturur."""
     rows = []
     for order in orders:
-        order_no = order.get("orderNumber", "")
+        order_no   = order.get("orderNumber", "")
         order_date = datetime.fromtimestamp(
             order.get("orderDate", 0) / 1000
         ).strftime("%d.%m.%Y %H:%M") if order.get("orderDate") else ""
@@ -280,37 +280,33 @@ def build_excel(orders: list, days: int) -> bytes:
             barcode  = line.get("barcode", "")
             supplier = match_supplier(barcode) or "Diğer"
             rows.append({
-                "Sipariş No":    order_no,
-                "Tarih":         order_date,
-                "Durum":         status,
-                "Ürün Adı":      line.get("productName", ""),
-                "Beden":         line.get("productSize", ""),
-                "Adet":          line.get("quantity", 1),
-                "Tutar (₺)":     line.get("lineGrossAmount", line.get("amount", 0)),
-                "Barkod":        barcode,
-                "Tedarikçi":     supplier,
+                "Sipariş No":  order_no,
+                "Tarih":       order_date,
+                "Durum":       status,
+                "Ürün Adı":    line.get("productName", ""),
+                "Beden":       line.get("productSize", ""),
+                "Adet":        line.get("quantity", 1),
+                "Tutar (₺)":   round(line.get("lineGrossAmount", line.get("amount", 0)), 2),
+                "Barkod":      barcode,
+                "Tedarikçi":   supplier,
             })
 
     df_orders = pd.DataFrame(rows)
 
-    # Tedarikçi özet
+    supplier_summary = pd.DataFrame()
+    product_summary  = pd.DataFrame()
+
     if not df_orders.empty:
         supplier_summary = df_orders.groupby("Tedarikçi").agg(
             Sipariş_Adedi=("Sipariş No", "nunique"),
             Toplam_Adet=("Adet", "sum"),
             Toplam_Tutar=("Tutar (₺)", "sum"),
         ).reset_index()
-    else:
-        supplier_summary = pd.DataFrame()
 
-    # Ürün özet
-    if not df_orders.empty:
         product_summary = df_orders.groupby("Ürün Adı").agg(
             Toplam_Adet=("Adet", "sum"),
             Toplam_Tutar=("Tutar (₺)", "sum"),
         ).sort_values("Toplam_Adet", ascending=False).reset_index()
-    else:
-        product_summary = pd.DataFrame()
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -319,6 +315,15 @@ def build_excel(orders: list, days: int) -> bytes:
             supplier_summary.to_excel(writer, sheet_name="Tedarikçi Bazlı", index=False)
         if not product_summary.empty:
             product_summary.to_excel(writer, sheet_name="Ürün Bazlı", index=False)
+
+        # Tüm sayfalarda sütun genişliklerini otomatik ayarla
+        for sheet in writer.sheets.values():
+            for col in sheet.columns:
+                max_len = max(
+                    (len(str(cell.value)) if cell.value is not None else 0 for cell in col),
+                    default=10,
+                )
+                sheet.column_dimensions[col[0].column_letter].width = min(max_len + 3, 60)
 
     return buf.getvalue()
 
@@ -336,7 +341,7 @@ def summarize_orders(orders: list, days: int) -> str:
 
     for order in orders:
         status = order.get("status", "")
-        if status in ("Cancelled",):
+        if status == "Cancelled":
             cancelled += 1
         if status in ("Returned", "UnDelivered"):
             returned += 1
@@ -465,6 +470,7 @@ async def check_new_orders():
 
 Lütfen hazırlayınız ✅"""
                 await send_telegram_to(chat_id, msg)
+                log.info(f"Bildirim → {supplier}: {product_name} ({size})")
 
         _notified_orders.add(order_id)
         if len(_notified_orders) > 1000:
@@ -501,8 +507,6 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
             data = r.json()
             if "id" in data:
                 container_ids.append(data["id"])
-            else:
-                log.error(f"Instagram container hatası: {data}")
 
         if not container_ids:
             return {"error": "Hiç container oluşturulamadı"}
@@ -721,7 +725,6 @@ async def scheduled_carousel():
 
     ig_ok = "id" in str(ig) and "error" not in ig
     fb_ok = "id" in str(fb) and "error" not in fb
-
     await notify_telegram(f"📸 *Carousel Post*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'} | FB: {'✅' if fb_ok else '❌'}")
 
 
@@ -790,19 +793,17 @@ async def send_telegram(chat_id: int, text: str) -> None:
 
 
 async def handle_order_report(chat_id: int, text: str) -> None:
-    days = extract_days(text)
+    days       = extract_days(text)
     want_excel = is_excel_request(text)
 
     await send_telegram(chat_id, f"⏳ Son {days} günlük gerçek veriler çekiliyor...")
     orders = await fetch_orders(days)
 
-    # Her zaman metin özeti gönder
     summary = summarize_orders(orders, days)
     await send_telegram(chat_id, summary)
 
-    # Excel isteniyorsa veya sipariş varsa Excel de gönder
     if want_excel and orders:
-        filename = f"siparis_raporu_{days}gun_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        filename    = f"siparis_raporu_{days}gun_{datetime.now().strftime('%Y%m%d')}.xlsx"
         excel_bytes = build_excel(orders, days)
         await send_excel_to_telegram(chat_id, excel_bytes, filename)
         log.info(f"Excel gönderildi: {filename}")
