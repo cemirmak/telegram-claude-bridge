@@ -1,6 +1,11 @@
 """
 Telegram → Claude Managed Agents köprüsü
 Render.com'da çalışır (FastAPI + httpx + APScheduler)
+
+Zamanlama (TR saati):
+  10:00, 14:00, 20:00 → Carousel post (Instagram + Facebook)
+  20:30               → Reels (sadece Instagram)
+  00:00               → Story (Instagram + Facebook)
 """
 
 import os, asyncio, logging, time, base64
@@ -20,8 +25,8 @@ TELEGRAM_TOKEN        = os.environ["TELEGRAM_TOKEN"]
 AGENT_ID              = os.environ["AGENT_ID"]
 SESSION_ID            = os.environ.get("SESSION_ID", "")
 ENV_ID                = os.environ["ENV_ID"]
-META_ACCESS_TOKEN     = os.environ.get("META_ACCESS_TOKEN", "")       # Instagram token
-FACEBOOK_ACCESS_TOKEN = os.environ.get("FACEBOOK_ACCESS_TOKEN", "")  # Facebook Page token
+META_ACCESS_TOKEN     = os.environ.get("META_ACCESS_TOKEN", "")       # Instagram
+FACEBOOK_ACCESS_TOKEN = os.environ.get("FACEBOOK_ACCESS_TOKEN", "")  # Facebook
 INSTAGRAM_ACCOUNT_ID  = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
 FACEBOOK_PAGE_ID      = os.environ.get("FACEBOOK_PAGE_ID", "")
 IMGBB_API_KEY         = os.environ.get("IMGBB_API_KEY", "")
@@ -166,7 +171,7 @@ async def upload_to_imgbb(image_url: str) -> str:
         log.error(f"ImgBB exception: {e}")
         return ""
 
-# ─── Instagram API (META_ACCESS_TOKEN) ──────────────────────────────────────
+# ─── Instagram API ───────────────────────────────────────────────────────────
 
 async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
     async with httpx.AsyncClient(timeout=60) as client:
@@ -254,7 +259,7 @@ async def instagram_story_post(image_url: str) -> dict:
             log.error(f"Instagram Story publish hatası: {r.status_code} {r.text}")
         return r.json()
 
-# ─── Facebook API (FACEBOOK_ACCESS_TOKEN) ───────────────────────────────────
+# ─── Facebook API ────────────────────────────────────────────────────────────
 
 async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
     async with httpx.AsyncClient(timeout=60) as client:
@@ -284,47 +289,12 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
         return r.json()
 
 
-async def facebook_reels_post(video_url: str, caption: str) -> dict:
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(
-            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
-            params={"upload_phase": "start", "access_token": FACEBOOK_ACCESS_TOKEN},
-        )
-        if r.status_code != 200:
-            log.error(f"Facebook Reels start hatası: {r.status_code} {r.text}")
-            return {"error": r.text}
-
-        data = r.json()
-        video_id = data.get("video_id")
-        if not video_id:
-            return {"error": str(data)}
-
-        r = await client.post(
-            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
-            params={
-                "upload_phase": "finish",
-                "video_id": video_id,
-                "video_url": video_url,
-                "description": caption,
-                "access_token": FACEBOOK_ACCESS_TOKEN,
-            },
-        )
-        if r.status_code != 200:
-            log.error(f"Facebook Reels finish hatası: {r.status_code} {r.text}")
-        return r.json()
-
-
 async def facebook_story_post(image_url: str) -> dict:
     """2 adımlı: önce unpublished yükle, sonra photo_id ile story paylaş."""
     async with httpx.AsyncClient(timeout=60) as client:
-        # Adım 1: Fotoğrafı unpublished yükle
         r = await client.post(
             f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photos",
-            params={
-                "url": image_url,
-                "published": "false",
-                "access_token": FACEBOOK_ACCESS_TOKEN,
-            },
+            params={"url": image_url, "published": "false", "access_token": FACEBOOK_ACCESS_TOKEN},
         )
         if r.status_code != 200:
             log.error(f"Facebook foto yükleme hatası: {r.status_code} {r.text}")
@@ -334,13 +304,9 @@ async def facebook_story_post(image_url: str) -> dict:
         if not photo_id:
             return {"error": "photo_id alınamadı"}
 
-        # Adım 2: photo_id ile story paylaş
         r = await client.post(
             f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photo_stories",
-            params={
-                "photo_id": photo_id,
-                "access_token": FACEBOOK_ACCESS_TOKEN,
-            },
+            params={"photo_id": photo_id, "access_token": FACEBOOK_ACCESS_TOKEN},
         )
         if r.status_code != 200:
             log.error(f"Facebook Story hatası: {r.status_code} {r.text}")
@@ -468,6 +434,7 @@ async def scheduled_carousel():
 
 
 async def scheduled_reels():
+    """Sadece Instagram Reels — Facebook binary upload gerektirdiği için desteklenmiyor."""
     log.info("⏰ Reels paylaşımı başlıyor...")
     df = load_products()
     if df.empty:
@@ -482,12 +449,10 @@ async def scheduled_reels():
     log.info(f"Reels ürün: {product['name']} | {product['video_url']}")
     caption = await generate_caption(product)
     ig = await instagram_reels_post(product["video_url"], caption)
-    fb = await facebook_reels_post(product["video_url"], caption)
 
     ig_ok = "id" in str(ig) and "error" not in ig
-    fb_ok = "id" in str(fb) and "error" not in fb
 
-    await notify_telegram(f"🎬 *Reels*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'} | FB: {'✅' if fb_ok else '❌'}")
+    await notify_telegram(f"🎬 *Reels*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'}")
 
 
 async def scheduled_story():
@@ -561,7 +526,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(scheduled_reels,    CronTrigger(hour=20, minute=30))
     scheduler.add_job(scheduled_story,    CronTrigger(hour=0,  minute=0))
     scheduler.start()
-    log.info("⏰ Carousel 10:00/14:00/20:00 | Reels 20:30 | Story 00:00 (TR)")
+    log.info("⏰ Carousel 10:00/14:00/20:00 | Reels 20:30 (IG) | Story 00:00 (TR)")
 
     yield
     scheduler.shutdown()
