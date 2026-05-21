@@ -9,7 +9,7 @@ Zamanlama (TR saati):
   00:00                → Story (Instagram + Facebook)
 """
 
-import os, asyncio, logging, time, base64, json, re
+import os, asyncio, logging, time, base64, json, re, io
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
@@ -212,13 +212,12 @@ def get_trendyol_headers() -> dict:
 
 
 async def fetch_orders(days: int = 1) -> list:
-    """Belirtilen gün sayısı kadar geriye gidip siparişleri çeker."""
     end_ms   = int(datetime.now().timestamp() * 1000)
     start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
 
-    url    = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
+    url        = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
     all_orders = []
-    page = 0
+    page       = 0
 
     while True:
         params = {
@@ -230,7 +229,6 @@ async def fetch_orders(days: int = 1) -> list:
             async with httpx.AsyncClient(timeout=20) as client:
                 r = await client.get(url, headers=get_trendyol_headers(), params=params)
             if r.status_code != 200:
-                log.warning(f"Trendyol hata: {r.status_code}")
                 break
             data        = r.json()
             content     = data.get("content", [])
@@ -247,7 +245,6 @@ async def fetch_orders(days: int = 1) -> list:
 
 
 async def fetch_new_orders() -> list:
-    """Son 30 dakikanın Created siparişlerini çeker."""
     end_ms   = int(datetime.now().timestamp() * 1000)
     start_ms = int((datetime.now() - timedelta(minutes=30)).timestamp() * 1000)
 
@@ -269,8 +266,64 @@ async def fetch_new_orders() -> list:
         return []
 
 
+def build_excel(orders: list, days: int) -> bytes:
+    """Sipariş listesinden Excel dosyası oluşturur, bytes döndürür."""
+    rows = []
+    for order in orders:
+        order_no = order.get("orderNumber", "")
+        order_date = datetime.fromtimestamp(
+            order.get("orderDate", 0) / 1000
+        ).strftime("%d.%m.%Y %H:%M") if order.get("orderDate") else ""
+        status = order.get("status", "")
+
+        for line in order.get("lines", []):
+            barcode  = line.get("barcode", "")
+            supplier = match_supplier(barcode) or "Diğer"
+            rows.append({
+                "Sipariş No":    order_no,
+                "Tarih":         order_date,
+                "Durum":         status,
+                "Ürün Adı":      line.get("productName", ""),
+                "Beden":         line.get("productSize", ""),
+                "Adet":          line.get("quantity", 1),
+                "Tutar (₺)":     line.get("lineGrossAmount", line.get("amount", 0)),
+                "Barkod":        barcode,
+                "Tedarikçi":     supplier,
+            })
+
+    df_orders = pd.DataFrame(rows)
+
+    # Tedarikçi özet
+    if not df_orders.empty:
+        supplier_summary = df_orders.groupby("Tedarikçi").agg(
+            Sipariş_Adedi=("Sipariş No", "nunique"),
+            Toplam_Adet=("Adet", "sum"),
+            Toplam_Tutar=("Tutar (₺)", "sum"),
+        ).reset_index()
+    else:
+        supplier_summary = pd.DataFrame()
+
+    # Ürün özet
+    if not df_orders.empty:
+        product_summary = df_orders.groupby("Ürün Adı").agg(
+            Toplam_Adet=("Adet", "sum"),
+            Toplam_Tutar=("Tutar (₺)", "sum"),
+        ).sort_values("Toplam_Adet", ascending=False).reset_index()
+    else:
+        product_summary = pd.DataFrame()
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_orders.to_excel(writer, sheet_name="Tüm Siparişler", index=False)
+        if not supplier_summary.empty:
+            supplier_summary.to_excel(writer, sheet_name="Tedarikçi Bazlı", index=False)
+        if not product_summary.empty:
+            product_summary.to_excel(writer, sheet_name="Ürün Bazlı", index=False)
+
+    return buf.getvalue()
+
+
 def summarize_orders(orders: list, days: int) -> str:
-    """Sipariş listesinden özet metin üretir."""
     if not orders:
         return f"Son {days} günde hiç sipariş bulunamadı."
 
@@ -278,8 +331,8 @@ def summarize_orders(orders: list, days: int) -> str:
     total_qty      = 0
     supplier_stats: dict = {}
     product_stats: dict  = {}
-    cancelled      = 0
-    returned       = 0
+    cancelled = 0
+    returned  = 0
 
     for order in orders:
         status = order.get("status", "")
@@ -308,13 +361,11 @@ def summarize_orders(orders: list, days: int) -> str:
             product_stats[name]["qty"]    += qty
             product_stats[name]["amount"] += amount
 
-    # Tedarikçi tablosu
     supplier_lines = []
     for sup, stats in sorted(supplier_stats.items(), key=lambda x: x[1]["amount"], reverse=True):
         pay = (stats["amount"] / total_amount * 100) if total_amount else 0
         supplier_lines.append(f"  • {sup}: {stats['qty']} adet | {stats['amount']:.2f}₺ (%{pay:.0f})")
 
-    # En çok satan 5 ürün
     top5 = sorted(product_stats.items(), key=lambda x: x[1]["qty"], reverse=True)[:5]
     top5_lines = [f"  {i+1}. {name[:45]} → {s['qty']} adet | {s['amount']:.2f}₺"
                   for i, (name, s) in enumerate(top5)]
@@ -322,7 +373,7 @@ def summarize_orders(orders: list, days: int) -> str:
     komisyon = total_amount * 0.215
     net_kar  = total_amount - komisyon - (total_qty * 27.5)
 
-    summary = f"""📊 *Son {days} Günlük Sipariş Özeti*
+    return f"""📊 *Son {days} Günlük Sipariş Özeti*
 _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 
 💰 *Finansal*
@@ -340,11 +391,8 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 
 _✅ Gerçek Trendyol verisi_"""
 
-    return summary
-
 
 def extract_days(text: str) -> int:
-    """Kullanıcı mesajından gün sayısını çıkarır."""
     text = text.lower()
     if "bugün" in text or "bugünkü" in text:
         return 1
@@ -355,19 +403,29 @@ def extract_days(text: str) -> int:
     match = re.search(r"(\d+)\s*gün", text)
     if match:
         return min(int(match.group(1)), 30)
-    return 3  # varsayılan
+    return 3
 
 
 def is_order_report_request(text: str) -> bool:
-    """Kullanıcı sipariş raporu mu istiyor?"""
-    keywords = [
-        "sipariş", "satış", "rapor", "özet", "kazanç",
-        "kâr", "gelir", "ciro", "kaç sipariş", "kaç satış"
-    ]
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in keywords)
+    keywords = ["sipariş", "satış", "rapor", "özet", "kazanç", "kâr", "gelir", "ciro", "kaç sipariş", "kaç satış"]
+    return any(kw in text.lower() for kw in keywords)
 
-# ─── Sipariş kontrolü (her 5 dk) ────────────────────────────────────────────
+
+def is_excel_request(text: str) -> bool:
+    keywords = ["excel", "xlsx", "dosya", "indir", "tablo"]
+    return any(kw in text.lower() for kw in keywords) and is_order_report_request(text)
+
+# ─── Telegram dosya gönderme ─────────────────────────────────────────────────
+
+async def send_excel_to_telegram(chat_id: int, excel_bytes: bytes, filename: str) -> None:
+    async with httpx.AsyncClient(timeout=60) as client:
+        await client.post(
+            f"{TELEGRAM_BASE}/sendDocument",
+            data={"chat_id": str(chat_id)},
+            files={"document": (filename, excel_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+
+# ─── Sipariş kontrolü ────────────────────────────────────────────────────────
 
 async def check_new_orders():
     global _notified_orders
@@ -407,7 +465,6 @@ async def check_new_orders():
 
 Lütfen hazırlayınız ✅"""
                 await send_telegram_to(chat_id, msg)
-                log.info(f"Bildirim → {supplier}: {product_name} ({size})")
 
         _notified_orders.add(order_id)
         if len(_notified_orders) > 1000:
@@ -456,7 +513,6 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
         )
         carousel = r.json()
         if "id" not in carousel:
-            log.error(f"Carousel hatası: {r.status_code} {r.text}")
             return {"error": str(carousel)}
 
         await asyncio.sleep(15)
@@ -465,8 +521,6 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
             params={"creation_id": carousel["id"], "access_token": META_ACCESS_TOKEN},
         )
-        if r.status_code != 200:
-            log.error(f"Carousel publish hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -477,21 +531,15 @@ async def instagram_reels_post(video_url: str, caption: str) -> dict:
             params={"media_type": "REELS", "video_url": video_url, "caption": caption, "access_token": META_ACCESS_TOKEN},
         )
         if r.status_code != 200:
-            log.error(f"Reels container hatası: {r.status_code} {r.text}")
             return {"error": r.text}
-
         data = r.json()
         if "id" not in data:
             return {"error": str(data)}
-
         await asyncio.sleep(30)
-
         r = await client.post(
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
             params={"creation_id": data["id"], "access_token": META_ACCESS_TOKEN},
         )
-        if r.status_code != 200:
-            log.error(f"Reels publish hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -502,21 +550,15 @@ async def instagram_story_post(image_url: str) -> dict:
             params={"media_type": "STORIES", "image_url": image_url, "access_token": META_ACCESS_TOKEN},
         )
         if r.status_code != 200:
-            log.error(f"Story container hatası: {r.status_code} {r.text}")
             return {"error": r.text}
-
         data = r.json()
         if "id" not in data:
             return {"error": str(data)}
-
         await asyncio.sleep(10)
-
         r = await client.post(
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
             params={"creation_id": data["id"], "access_token": META_ACCESS_TOKEN},
         )
-        if r.status_code != 200:
-            log.error(f"Story publish hatası: {r.status_code} {r.text}")
         return r.json()
 
 # ─── Facebook API ────────────────────────────────────────────────────────────
@@ -532,8 +574,6 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
             data = r.json()
             if "id" in data:
                 photo_ids.append({"media_fbid": data["id"]})
-            else:
-                log.error(f"Facebook foto hatası: {data}")
             await asyncio.sleep(1)
 
         if not photo_ids:
@@ -544,8 +584,6 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
             params={"access_token": FACEBOOK_ACCESS_TOKEN},
             json={"message": caption, "attached_media": photo_ids},
         )
-        if r.status_code != 200:
-            log.error(f"Facebook carousel hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -556,19 +594,14 @@ async def facebook_story_post(image_url: str) -> dict:
             params={"url": image_url, "published": "false", "access_token": FACEBOOK_ACCESS_TOKEN},
         )
         if r.status_code != 200:
-            log.error(f"Facebook foto yükleme hatası: {r.status_code} {r.text}")
             return {"error": r.text}
-
         photo_id = r.json().get("id")
         if not photo_id:
             return {"error": "photo_id alınamadı"}
-
         r = await client.post(
             f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photo_stories",
             params={"photo_id": photo_id, "access_token": FACEBOOK_ACCESS_TOKEN},
         )
-        if r.status_code != 200:
-            log.error(f"Facebook Story hatası: {r.status_code} {r.text}")
         return r.json()
 
 # ─── Ürün seçimi ────────────────────────────────────────────────────────────
@@ -707,7 +740,6 @@ async def scheduled_reels():
     caption = await generate_caption(product)
     ig = await instagram_reels_post(product["video_url"], caption)
     ig_ok = "id" in str(ig) and "error" not in ig
-
     await notify_telegram(f"🎬 *Reels*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'}")
 
 
@@ -732,7 +764,6 @@ async def scheduled_story():
 
     ig_ok = "id" in str(ig) and "error" not in ig
     fb_ok = "id" in str(fb) and "error" not in fb
-
     await notify_telegram(f"📖 *Story*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'} | FB: {'✅' if fb_ok else '❌'}")
 
 
@@ -759,18 +790,26 @@ async def send_telegram(chat_id: int, text: str) -> None:
 
 
 async def handle_order_report(chat_id: int, text: str) -> None:
-    """Gerçek Trendyol verisinden sipariş özeti oluşturur."""
     days = extract_days(text)
-    await send_telegram(chat_id, f"⏳ Son {days} günlük gerçek veriler çekiliyor...")
+    want_excel = is_excel_request(text)
 
+    await send_telegram(chat_id, f"⏳ Son {days} günlük gerçek veriler çekiliyor...")
     orders = await fetch_orders(days)
+
+    # Her zaman metin özeti gönder
     summary = summarize_orders(orders, days)
     await send_telegram(chat_id, summary)
+
+    # Excel isteniyorsa veya sipariş varsa Excel de gönder
+    if want_excel and orders:
+        filename = f"siparis_raporu_{days}gun_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        excel_bytes = build_excel(orders, days)
+        await send_excel_to_telegram(chat_id, excel_bytes, filename)
+        log.info(f"Excel gönderildi: {filename}")
 
 
 async def handle_message(chat_id: int, text: str) -> None:
     try:
-        # Sipariş/satış raporu isteği mi?
         if is_order_report_request(text):
             await handle_order_report(chat_id, text)
         else:
