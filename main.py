@@ -290,13 +290,18 @@ async def facebook_reels_post(video_url: str, caption: str) -> dict:
 
 
 async def facebook_story_post(image_url: str) -> dict:
+    """Facebook sayfasına fotoğraf paylaşır (story yerine normal post)."""
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
-            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photo_stories",
-            params={"url": image_url, "access_token": META_ACCESS_TOKEN},
+            f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photos",
+            params={
+                "url": image_url,
+                "published": "true",
+                "access_token": META_ACCESS_TOKEN,
+            },
         )
         if r.status_code != 200:
-            log.error(f"Facebook Story hatası: {r.status_code} {r.text}")
+            log.error(f"Facebook foto hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -351,7 +356,10 @@ def pick_product(df: pd.DataFrame, require_video: bool = False) -> dict:
         available = df
 
     if require_video and "Video URL" in df.columns:
-        with_video = available[available["Video URL"].notna() & (available["Video URL"].astype(str).str.startswith("http"))]
+        with_video = available[
+            available["Video URL"].notna() &
+            available["Video URL"].astype(str).str.startswith("http")
+        ]
         if not with_video.empty:
             available = with_video
 
