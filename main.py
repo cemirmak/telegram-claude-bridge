@@ -9,7 +9,7 @@ Zamanlama (TR saati):
   00:00                → Story (Instagram + Facebook)
 """
 
-import os, asyncio, logging, time, base64
+import os, asyncio, logging, time, base64, json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
@@ -35,17 +35,17 @@ IMGBB_API_KEY         = os.environ.get("IMGBB_API_KEY", "")
 TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Trendyol
-TRENDYOL_API_KEY      = os.environ.get("TRENDYOL_API_KEY", "")
-TRENDYOL_API_SECRET   = os.environ.get("TRENDYOL_API_SECRET", "")
-TRENDYOL_SUPPLIER_ID  = os.environ.get("TRENDYOL_SUPPLIER_ID", "1075171")
+TRENDYOL_API_KEY     = os.environ.get("TRENDYOL_API_KEY", "")
+TRENDYOL_API_SECRET  = os.environ.get("TRENDYOL_API_SECRET", "")
+TRENDYOL_SUPPLIER_ID = os.environ.get("TRENDYOL_SUPPLIER_ID", "1075171")
 
 # Tedarikçi Telegram chat ID'leri
 SUPPLIER_CHAT_IDS = {
-    "Yusuf Cem": int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
-    "Cem Irmak": int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
-    # Volkan Karasu ve Özer Özcan sonradan eklenecek
-    # "Volkan Karasu": int(os.environ.get("VOLKAN_CHAT_ID", "0")),
-    # "Özer Özcan": int(os.environ.get("OZER_CHAT_ID", "0")),
+    "Yusuf Cem":    int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    "Cem Irmak":    int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    # Sonradan eklenecek:
+    # "VOLKAN KARASU": int(os.environ.get("VOLKAN_CHAT_ID", "0")),
+    # "Özer Denim":    int(os.environ.get("OZER_CHAT_ID", "0")),
 }
 
 CLAUDE_BASE   = "https://api.anthropic.com"
@@ -64,6 +64,7 @@ CLAUDE_HEADERS = {
 POLL_INTERVAL = 2
 POLL_TIMEOUT  = 300
 EXCEL_PATH    = "urunler.xlsx"
+SUPPLIER_JSON = "tedarikci-eslesme.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -71,7 +72,38 @@ log = logging.getLogger(__name__)
 _active_session_id: str = SESSION_ID
 _posted_today: set = set()
 _posted_date: str = ""
-_notified_orders: set = set()  # Bildirim gönderilmiş sipariş ID'leri
+_notified_orders: set = set()
+SUPPLIER_DATA: dict = {}
+
+# ─── Tedarikçi verisi ────────────────────────────────────────────────────────
+
+def load_supplier_data():
+    global SUPPLIER_DATA
+    try:
+        with open(SUPPLIER_JSON, "r", encoding="utf-8") as f:
+            SUPPLIER_DATA = json.load(f)
+        log.info(f"Tedarikçi verisi yüklendi: {len(SUPPLIER_DATA.get('product_costs', {}))} ürün")
+    except Exception as e:
+        log.error(f"Tedarikçi verisi yüklenemedi: {e}")
+
+
+def match_supplier(barcode: str) -> str:
+    """Barkod üzerinden tedarikçi adını döndürür."""
+    costs     = SUPPLIER_DATA.get("product_costs", {})
+    suppliers = SUPPLIER_DATA.get("suppliers", {})
+
+    entry = costs.get(str(barcode))
+    if not entry:
+        for key, val in costs.items():
+            if str(barcode) in key or key in str(barcode):
+                entry = val
+                break
+
+    if not entry or not entry.get("supplierId"):
+        return ""
+
+    supplier = suppliers.get(entry["supplierId"], {})
+    return supplier.get("name", "")
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
@@ -180,19 +212,19 @@ def get_trendyol_headers() -> dict:
 
 
 async def fetch_new_orders() -> list:
-    """Son 30 dakikanın yeni siparişlerini çeker."""
+    """Son 30 dakikanın Created siparişlerini çeker."""
     end_ms   = int(datetime.now().timestamp() * 1000)
     start_ms = int((datetime.now() - timedelta(minutes=30)).timestamp() * 1000)
 
     url = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
     params = {
-        "startDate": start_ms,
-        "endDate":   end_ms,
-        "size":      50,
-        "page":      0,
-        "orderByField": "OrderDate",
+        "startDate":        start_ms,
+        "endDate":          end_ms,
+        "size":             50,
+        "page":             0,
+        "orderByField":     "OrderDate",
         "orderByDirection": "DESC",
-        "status": "Created",
+        "status":           "Created",
     }
 
     try:
@@ -207,26 +239,8 @@ async def fetch_new_orders() -> list:
         return []
 
 
-def match_supplier(product_name: str, barcode: str) -> str:
-    """
-    Ürünü tedarikçiye eşleştir.
-    Şimdilik Excel'deki supplier-product-map verisini kullanıyor.
-    Tedarikçi eklendikçe genişletilebilir.
-    """
-    # Basit kural tabanlı eşleştirme — memory store'a erişim olmadığı için
-    # Excel'den okunan ürün listesiyle eşleştiriyoruz
-    try:
-        df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
-        match = df[df["Barkod"].astype(str) == str(barcode)]
-        if not match.empty and "Tedarikçi" in df.columns:
-            return match.iloc[0]["Tedarikçi"]
-    except Exception:
-        pass
-    return ""
-
-
 async def check_new_orders():
-    """Her 5 dakikada bir çalışır — yeni siparişleri kontrol eder."""
+    """Her 5 dakikada çalışır — yeni siparişleri tedarikçilere bildirir."""
     global _notified_orders
 
     if not TRENDYOL_API_KEY or not TRENDYOL_API_SECRET:
@@ -241,7 +255,6 @@ async def check_new_orders():
         if not order_id or order_id in _notified_orders:
             continue
 
-        # Siparişteki ürünleri işle
         lines = order.get("lines", [])
         for line in lines:
             product_name = line.get("productName", "")
@@ -250,24 +263,23 @@ async def check_new_orders():
             size         = line.get("productSize", "")
             amount       = line.get("amount", 0)
 
-            supplier = match_supplier(product_name, barcode)
+            supplier = match_supplier(barcode)
             chat_id  = SUPPLIER_CHAT_IDS.get(supplier, 0)
 
             if chat_id:
                 msg = f"""🛍 *Yeni Sipariş!*
 
-📦 Ürün: {product_name}
+📦 *{product_name}*
 📏 Beden: {size}
 🔢 Adet: {quantity}
 💰 Tutar: {amount:.2f}₺
 🏪 Sipariş No: {order.get('orderNumber', order_id)}
 
-Lütfen hazırlayınız. ✅"""
+Lütfen hazırlayınız ✅"""
                 await send_telegram_to(chat_id, msg)
-                log.info(f"Tedarikçi bildirimi gönderildi: {supplier} → {product_name}")
+                log.info(f"Bildirim → {supplier}: {product_name} ({size})")
 
         _notified_orders.add(order_id)
-        # Bellek şişmesin diye 1000'den fazla ID varsa eskilerini temizle
         if len(_notified_orders) > 1000:
             _notified_orders = set(list(_notified_orders)[-500:])
 
@@ -604,6 +616,8 @@ async def notify_telegram(text: str):
 
 
 async def send_telegram_to(chat_id: int, text: str) -> None:
+    if not chat_id:
+        return
     async with httpx.AsyncClient() as client:
         await client.post(
             f"{TELEGRAM_BASE}/sendMessage",
@@ -630,6 +644,9 @@ scheduler = AsyncIOScheduler(timezone="Europe/Istanbul")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Tedarikçi verisini yükle
+    load_supplier_data()
+
     try:
         sid = await get_or_create_session()
         log.info(f"✅ Hazır. Aktif session: {sid}")
