@@ -6,3 +6,9 @@ fastapi
 uvicorn
 httpx
 apscheduler
+fastapi
+uvicorn
+httpx
+apscheduler
+pandas
+openpyxl
