@@ -53,14 +53,14 @@ CLAUDE_HEADERS = {
 POLL_INTERVAL = 2
 POLL_TIMEOUT  = 300
 
-# Ürün Excel dosyası — Render'da /tmp'ye kopyalanır
 EXCEL_PATH = "urunler.xlsx"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 _active_session_id: str = SESSION_ID
-_posted_today: set = set()  # Bugün paylaşılan model kodları
+_posted_today: set = set()
+_posted_date: str = ""
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
@@ -221,6 +221,9 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
         if "id" not in carousel:
             return {"error": str(carousel)}
 
+        # Instagram container hazır olana kadar bekle
+        await asyncio.sleep(15)
+
         r = await client.post(
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
             params={
@@ -278,27 +281,23 @@ async def post_to_social_media(trendyol_image_urls: list, caption: str) -> dict:
 
     return {"instagram": ig_result, "facebook": fb_result}
 
-# ─── Ürün seçimi ve caption oluşturma ───────────────────────────────────────
+# ─── Ürün seçimi ve caption ──────────────────────────────────────────────────
 
 def load_products() -> pd.DataFrame:
-    """Excel'den benzersiz ürünleri yükle."""
     try:
         df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
-        unique = df.drop_duplicates(subset=["Model Kodu"])
-        return unique
+        return df.drop_duplicates(subset=["Model Kodu"])
     except Exception as e:
         log.error(f"Excel okunamadı: {e}")
         return pd.DataFrame()
 
 
 def pick_product(df: pd.DataFrame) -> dict:
-    """Bugün paylaşılmamış rastgele bir ürün seç."""
-    global _posted_today
+    global _posted_today, _posted_date
 
-    # Gece yarısı sıfırla
     today = datetime.now().strftime("%Y-%m-%d")
-    if not hasattr(pick_product, "_date") or pick_product._date != today:
-        pick_product._date = today
+    if _posted_date != today:
+        _posted_date = today
         _posted_today = set()
 
     available = df[~df["Model Kodu"].isin(_posted_today)]
@@ -310,7 +309,10 @@ def pick_product(df: pd.DataFrame) -> dict:
     _posted_today.add(row["Model Kodu"])
 
     gorsel_cols = [f"Görsel {i}" for i in range(1, 9)]
-    image_urls = [row[c] for c in gorsel_cols if pd.notna(row.get(c)) and str(row.get(c)).startswith("http")]
+    image_urls = [
+        row[c] for c in gorsel_cols
+        if pd.notna(row.get(c)) and str(row.get(c)).startswith("http")
+    ]
 
     fiyat_col = "Trendyol'da Satılacak Fiyat (KDV Dahil)"
     return {
@@ -324,7 +326,6 @@ def pick_product(df: pd.DataFrame) -> dict:
 
 
 async def generate_caption(product: dict) -> str:
-    """Claude'a caption yazdır."""
     prompt = f"""Şu ürün için Instagram/Facebook carousel post caption'ı yaz:
 
 Ürün: {product['name']}
@@ -336,14 +337,13 @@ ZORUNLU FORMAT (sırayla):
 1. Satır 1: {product['link']}
 2. Türkçe etkileyici açıklama (2-3 cümle)
 3. 💰 Fiyat: {product['price']}₺
-4. En az 15 hashtag (#KotEtek #MiniEtek #REDZARRAM vb.)
+4. En az 15 hashtag
 
 Sadece caption metnini döndür, başka hiçbir şey yazma."""
 
     caption = await ask_claude(prompt)
-    # Agent gereksiz metin eklerse temizle
-    if "❌" in caption or "⏱" in caption:
-        # Fallback caption
+
+    if "❌" in caption or "⏱" in caption or "🤔" in caption:
         caption = f"""{product['link']}
 
 {product['name']} — Tarzını yansıt, stilini konuştur! ✨
@@ -356,12 +356,10 @@ Sadece caption metnini döndür, başka hiçbir şey yazma."""
 
 
 async def scheduled_post():
-    """Zamanlayıcı tarafından çağrılır — ürün seçer ve paylaşır."""
     log.info("⏰ Zamanlanmış paylaşım başlıyor...")
 
     df = load_products()
     if df.empty:
-        log.error("Ürün listesi boş, paylaşım yapılamadı")
         await notify_telegram("❌ Ürün listesi bulunamadı, paylaşım yapılamadı.")
         return
 
@@ -375,7 +373,7 @@ async def scheduled_post():
     caption = await generate_caption(product)
     results = await post_to_social_media(product["image_urls"], caption)
 
-    ig_ok = "id" in str(results.get("instagram", {}))
+    ig_ok = "id" in str(results.get("instagram", {})) and "error" not in str(results.get("instagram", {}).get("error", ""))
     fb_ok = "id" in str(results.get("facebook", {}))
 
     msg = f"""📱 *Otomatik Paylaşım*
@@ -389,7 +387,6 @@ Facebook: {"✅" if fb_ok else "❌"}"""
 
 
 async def notify_telegram(text: str):
-    """Belirli bir chat'e bildirim gönder."""
     if not TELEGRAM_CHAT_ID:
         return
     async with httpx.AsyncClient() as client:
@@ -423,14 +420,12 @@ scheduler = AsyncIOScheduler(timezone="Europe/Istanbul")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Session başlat
     try:
         sid = await get_or_create_session()
         log.info(f"✅ Hazır. Aktif session: {sid}")
     except Exception as exc:
         log.error(f"Session başlatılamadı: {exc}")
 
-    # Zamanlayıcıyı başlat — Türkiye saati 10:00, 14:00, 20:00
     scheduler.add_job(scheduled_post, CronTrigger(hour=10, minute=0))
     scheduler.add_job(scheduled_post, CronTrigger(hour=14, minute=0))
     scheduler.add_job(scheduled_post, CronTrigger(hour=20, minute=0))
@@ -438,7 +433,6 @@ async def lifespan(app: FastAPI):
     log.info("⏰ Zamanlayıcı başlatıldı: 10:00, 14:00, 20:00 (TR saati)")
 
     yield
-
     scheduler.shutdown()
 
 
@@ -464,7 +458,6 @@ async def webhook(request: Request, background: BackgroundTasks):
         await send_telegram(chat_id, "👋 Merhaba! REDZARRAM mağaza asistanına hoş geldiniz.")
         return JSONResponse({"ok": True})
 
-    # Manuel paylaşım tetikleyici
     if text.startswith("/post_now"):
         background.add_task(scheduled_post)
         await send_telegram(chat_id, "📤 Manuel paylaşım başlatıldı...")
