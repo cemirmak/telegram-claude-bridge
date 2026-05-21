@@ -11,9 +11,10 @@ Ortam değişkenleri (Render.com Environment):
   META_ACCESS_TOKEN     — Meta Graph API token
   INSTAGRAM_ACCOUNT_ID  — 17841426737963461
   FACEBOOK_PAGE_ID      — 1048704551666095
+  IMGBB_API_KEY         — ImgBB API anahtarı
 """
 
-import os, asyncio, logging, time
+import os, asyncio, logging, time, base64
 from contextlib import asynccontextmanager
 
 import httpx
@@ -29,10 +30,12 @@ ENV_ID               = os.environ["ENV_ID"]
 META_ACCESS_TOKEN    = os.environ.get("META_ACCESS_TOKEN", "")
 INSTAGRAM_ACCOUNT_ID = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
 FACEBOOK_PAGE_ID     = os.environ.get("FACEBOOK_PAGE_ID", "")
+IMGBB_API_KEY        = os.environ.get("IMGBB_API_KEY", "")
 
-CLAUDE_BASE  = "https://api.anthropic.com"
+CLAUDE_BASE   = "https://api.anthropic.com"
 TELEGRAM_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-GRAPH_BASE   = "https://graph.facebook.com/v19.0"
+GRAPH_BASE    = "https://graph.facebook.com/v19.0"
+IMGBB_BASE    = "https://api.imgbb.com/1/upload"
 
 CLAUDE_HEADERS = {
     "x-api-key":         CLAUDE_API_KEY,
@@ -157,11 +160,40 @@ def _extract_answer(events: list) -> str:
     parts = [b["text"] for b in msgs[-1].get("content", []) if isinstance(b, dict) and b.get("type") == "text"]
     return "\n".join(parts) if parts else "🤔 Boş cevap."
 
+# ─── ImgBB ──────────────────────────────────────────────────────────────────
+
+async def upload_to_imgbb(image_url: str) -> str:
+    """Trendyol CDN görselini ImgBB'ye yükler, public URL döndürür."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Görseli indir
+        r = await client.get(image_url)
+        if r.status_code != 200:
+            log.error(f"Görsel indirilemedi: {image_url}")
+            return ""
+        image_data = base64.b64encode(r.content).decode("utf-8")
+
+        # ImgBB'ye yükle
+        r = await client.post(
+            IMGBB_BASE,
+            data={
+                "key": IMGBB_API_KEY,
+                "image": image_data,
+            },
+        )
+        result = r.json()
+        if result.get("success"):
+            url = result["data"]["url"]
+            log.info(f"ImgBB yüklendi: {url}")
+            return url
+        else:
+            log.error(f"ImgBB hatası: {result}")
+            return ""
+
 # ─── Meta Graph API ─────────────────────────────────────────────────────────
 
 async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
-    """Instagram'a çoklu resim (carousel) post atar."""
-    async with httpx.AsyncClient(timeout=30) as client:
+    """Görselleri ImgBB'ye yükleyip Instagram carousel post atar."""
+    async with httpx.AsyncClient(timeout=60) as client:
 
         # 1) Her görsel için container oluştur
         container_ids = []
@@ -177,8 +209,11 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
             data = r.json()
             if "id" not in data:
                 log.error(f"Görsel container hatası: {data}")
-                return {"error": str(data)}
+                continue
             container_ids.append(data["id"])
+
+        if not container_ids:
+            return {"error": "Hiç görsel container oluşturulamadı"}
 
         # 2) Carousel container oluştur
         r = await client.post(
@@ -192,7 +227,6 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
         )
         carousel = r.json()
         if "id" not in carousel:
-            log.error(f"Carousel container hatası: {carousel}")
             return {"error": str(carousel)}
 
         # 3) Yayınla
@@ -210,9 +244,8 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
 
 async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
     """Facebook sayfasına çoklu resim post atar."""
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
 
-        # Her görseli ayrı yükle
         photo_ids = []
         for url in image_urls:
             r = await client.post(
@@ -232,7 +265,6 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
         if not photo_ids:
             return {"error": "Hiç fotoğraf yüklenemedi"}
 
-        # Hepsini tek post olarak yayınla
         r = await client.post(
             f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/feed",
             params={"access_token": META_ACCESS_TOKEN},
@@ -245,6 +277,32 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
         log.info(f"Facebook post yayınlandı: {result}")
         return result
 
+
+async def post_to_social_media(trendyol_image_urls: list, caption: str, platforms: list) -> dict:
+    """
+    Trendyol CDN URL'lerini ImgBB'ye yükler,
+    sonra Instagram ve/veya Facebook'a carousel post atar.
+    """
+    # ImgBB'ye yükle
+    log.info(f"{len(trendyol_image_urls)} görsel ImgBB'ye yükleniyor...")
+    imgbb_urls = []
+    for url in trendyol_image_urls[:10]:  # Instagram max 10
+        imgbb_url = await upload_to_imgbb(url)
+        if imgbb_url:
+            imgbb_urls.append(imgbb_url)
+
+    if not imgbb_urls:
+        return {"error": "Hiç görsel ImgBB'ye yüklenemedi"}
+
+    log.info(f"{len(imgbb_urls)} görsel yüklendi, paylaşılıyor...")
+
+    results = {}
+    if "instagram" in platforms:
+        results["instagram"] = await instagram_carousel_post(imgbb_urls, caption)
+    if "facebook" in platforms:
+        results["facebook"] = await facebook_carousel_post(imgbb_urls, caption)
+
+    return results
 
 # ─── Telegram ───────────────────────────────────────────────────────────────
 
@@ -303,11 +361,11 @@ async def webhook(request: Request, background: BackgroundTasks):
 
 
 @app.post("/post-product")
-async def post_product(request: Request):
+async def post_product(request: Request, background: BackgroundTasks):
     """
-    Agent bu endpoint'i çağırarak ürünü sosyal medyaya paylaşır.
+    Ürünü sosyal medyaya paylaşır.
     Body: {
-        "image_urls": [...],
+        "image_urls": [...],   # Trendyol CDN URL'leri
         "caption": "...",
         "platforms": ["instagram", "facebook"]
     }
@@ -320,14 +378,8 @@ async def post_product(request: Request):
     if not image_urls or not caption:
         return JSONResponse({"error": "image_urls ve caption zorunlu"}, status_code=400)
 
-    results = {}
-
-    if "instagram" in platforms:
-        results["instagram"] = await instagram_carousel_post(image_urls, caption)
-
-    if "facebook" in platforms:
-        results["facebook"] = await facebook_carousel_post(image_urls, caption)
-
+    # Arka planda çalıştır (uzun sürebilir)
+    results = await post_to_social_media(image_urls, caption, platforms)
     return JSONResponse(results)
 
 
