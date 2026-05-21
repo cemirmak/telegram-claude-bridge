@@ -3,19 +3,21 @@ Telegram → Claude Managed Agents köprüsü
 Render.com'da çalışır (FastAPI + httpx + APScheduler)
 
 Zamanlama (TR saati):
-  10:00, 14:00, 20:00 → Carousel post (Instagram + Facebook)
-  20:30               → Reels (sadece Instagram)
-  00:00               → Story (Instagram + Facebook)
+  Her 5 dakika         → Trendyol yeni sipariş kontrolü + tedarikçi bildirimi
+  10:00, 14:00, 20:00  → Carousel post (Instagram + Facebook)
+  20:30                → Reels (sadece Instagram)
+  00:00                → Story (Instagram + Facebook)
 """
 
 import os, asyncio, logging, time, base64
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 import pandas as pd
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
@@ -25,17 +27,32 @@ TELEGRAM_TOKEN        = os.environ["TELEGRAM_TOKEN"]
 AGENT_ID              = os.environ["AGENT_ID"]
 SESSION_ID            = os.environ.get("SESSION_ID", "")
 ENV_ID                = os.environ["ENV_ID"]
-META_ACCESS_TOKEN     = os.environ.get("META_ACCESS_TOKEN", "")       # Instagram
-FACEBOOK_ACCESS_TOKEN = os.environ.get("FACEBOOK_ACCESS_TOKEN", "")  # Facebook
+META_ACCESS_TOKEN     = os.environ.get("META_ACCESS_TOKEN", "")
+FACEBOOK_ACCESS_TOKEN = os.environ.get("FACEBOOK_ACCESS_TOKEN", "")
 INSTAGRAM_ACCOUNT_ID  = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
 FACEBOOK_PAGE_ID      = os.environ.get("FACEBOOK_PAGE_ID", "")
 IMGBB_API_KEY         = os.environ.get("IMGBB_API_KEY", "")
 TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# Trendyol
+TRENDYOL_API_KEY      = os.environ.get("TRENDYOL_API_KEY", "")
+TRENDYOL_API_SECRET   = os.environ.get("TRENDYOL_API_SECRET", "")
+TRENDYOL_SUPPLIER_ID  = os.environ.get("TRENDYOL_SUPPLIER_ID", "1075171")
+
+# Tedarikçi Telegram chat ID'leri
+SUPPLIER_CHAT_IDS = {
+    "Yusuf Cem": int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    "Cem Irmak": int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+    # Volkan Karasu ve Özer Özcan sonradan eklenecek
+    # "Volkan Karasu": int(os.environ.get("VOLKAN_CHAT_ID", "0")),
+    # "Özer Özcan": int(os.environ.get("OZER_CHAT_ID", "0")),
+}
+
 CLAUDE_BASE   = "https://api.anthropic.com"
 TELEGRAM_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GRAPH_BASE    = "https://graph.facebook.com/v19.0"
 IMGBB_BASE    = "https://api.imgbb.com/1/upload"
+TRENDYOL_BASE = "https://apigw.trendyol.com/integration"
 
 CLAUDE_HEADERS = {
     "x-api-key":         CLAUDE_API_KEY,
@@ -54,6 +71,7 @@ log = logging.getLogger(__name__)
 _active_session_id: str = SESSION_ID
 _posted_today: set = set()
 _posted_date: str = ""
+_notified_orders: set = set()  # Bildirim gönderilmiş sipariş ID'leri
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
@@ -149,6 +167,110 @@ def _extract_answer(events: list) -> str:
     parts = [b["text"] for b in msgs[-1].get("content", []) if isinstance(b, dict) and b.get("type") == "text"]
     return "\n".join(parts) if parts else "🤔 Boş cevap."
 
+# ─── Trendyol API ───────────────────────────────────────────────────────────
+
+def get_trendyol_headers() -> dict:
+    token = base64.b64encode(f"{TRENDYOL_API_KEY}:{TRENDYOL_API_SECRET}".encode()).decode()
+    return {
+        "Authorization": f"Basic {token}",
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+        "User-Agent":    f"{TRENDYOL_SUPPLIER_ID} - SelfIntegration",
+    }
+
+
+async def fetch_new_orders() -> list:
+    """Son 30 dakikanın yeni siparişlerini çeker."""
+    end_ms   = int(datetime.now().timestamp() * 1000)
+    start_ms = int((datetime.now() - timedelta(minutes=30)).timestamp() * 1000)
+
+    url = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/orders"
+    params = {
+        "startDate": start_ms,
+        "endDate":   end_ms,
+        "size":      50,
+        "page":      0,
+        "orderByField": "OrderDate",
+        "orderByDirection": "DESC",
+        "status": "Created",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, headers=get_trendyol_headers(), params=params)
+        if r.status_code != 200:
+            log.warning(f"Trendyol sipariş hatası: {r.status_code} {r.text[:200]}")
+            return []
+        return r.json().get("content", [])
+    except Exception as e:
+        log.error(f"Trendyol fetch hatası: {e}")
+        return []
+
+
+def match_supplier(product_name: str, barcode: str) -> str:
+    """
+    Ürünü tedarikçiye eşleştir.
+    Şimdilik Excel'deki supplier-product-map verisini kullanıyor.
+    Tedarikçi eklendikçe genişletilebilir.
+    """
+    # Basit kural tabanlı eşleştirme — memory store'a erişim olmadığı için
+    # Excel'den okunan ürün listesiyle eşleştiriyoruz
+    try:
+        df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
+        match = df[df["Barkod"].astype(str) == str(barcode)]
+        if not match.empty and "Tedarikçi" in df.columns:
+            return match.iloc[0]["Tedarikçi"]
+    except Exception:
+        pass
+    return ""
+
+
+async def check_new_orders():
+    """Her 5 dakikada bir çalışır — yeni siparişleri kontrol eder."""
+    global _notified_orders
+
+    if not TRENDYOL_API_KEY or not TRENDYOL_API_SECRET:
+        return
+
+    orders = await fetch_new_orders()
+    if not orders:
+        return
+
+    for order in orders:
+        order_id = str(order.get("id") or order.get("shipmentPackageId", ""))
+        if not order_id or order_id in _notified_orders:
+            continue
+
+        # Siparişteki ürünleri işle
+        lines = order.get("lines", [])
+        for line in lines:
+            product_name = line.get("productName", "")
+            barcode      = line.get("barcode", "")
+            quantity     = line.get("quantity", 1)
+            size         = line.get("productSize", "")
+            amount       = line.get("amount", 0)
+
+            supplier = match_supplier(product_name, barcode)
+            chat_id  = SUPPLIER_CHAT_IDS.get(supplier, 0)
+
+            if chat_id:
+                msg = f"""🛍 *Yeni Sipariş!*
+
+📦 Ürün: {product_name}
+📏 Beden: {size}
+🔢 Adet: {quantity}
+💰 Tutar: {amount:.2f}₺
+🏪 Sipariş No: {order.get('orderNumber', order_id)}
+
+Lütfen hazırlayınız. ✅"""
+                await send_telegram_to(chat_id, msg)
+                log.info(f"Tedarikçi bildirimi gönderildi: {supplier} → {product_name}")
+
+        _notified_orders.add(order_id)
+        # Bellek şişmesin diye 1000'den fazla ID varsa eskilerini temizle
+        if len(_notified_orders) > 1000:
+            _notified_orders = set(list(_notified_orders)[-500:])
+
 # ─── ImgBB ──────────────────────────────────────────────────────────────────
 
 async def upload_to_imgbb(image_url: str) -> str:
@@ -165,7 +287,6 @@ async def upload_to_imgbb(image_url: str) -> str:
             result = r.json()
             if result.get("success"):
                 return result["data"]["url"]
-            log.error(f"ImgBB hatası: {result}")
             return ""
     except Exception as e:
         log.error(f"ImgBB exception: {e}")
@@ -290,7 +411,6 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
 
 
 async def facebook_story_post(image_url: str) -> dict:
-    """2 adımlı: önce unpublished yükle, sonra photo_id ile story paylaş."""
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/photos",
@@ -434,7 +554,6 @@ async def scheduled_carousel():
 
 
 async def scheduled_reels():
-    """Sadece Instagram Reels — Facebook binary upload gerektirdiği için desteklenmiyor."""
     log.info("⏰ Reels paylaşımı başlıyor...")
     df = load_products()
     if df.empty:
@@ -446,10 +565,8 @@ async def scheduled_reels():
         await notify_telegram("⚠️ Reels: Video URL'si olan ürün bulunamadı.")
         return
 
-    log.info(f"Reels ürün: {product['name']} | {product['video_url']}")
     caption = await generate_caption(product)
     ig = await instagram_reels_post(product["video_url"], caption)
-
     ig_ok = "id" in str(ig) and "error" not in ig
 
     await notify_telegram(f"🎬 *Reels*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'}")
@@ -483,22 +600,21 @@ async def scheduled_story():
 async def notify_telegram(text: str):
     if not TELEGRAM_CHAT_ID:
         return
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            f"{TELEGRAM_BASE}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=10,
-        )
+    await send_telegram_to(int(TELEGRAM_CHAT_ID), text)
 
-# ─── Telegram ───────────────────────────────────────────────────────────────
 
-async def send_telegram(chat_id: int, text: str) -> None:
+async def send_telegram_to(chat_id: int, text: str) -> None:
     async with httpx.AsyncClient() as client:
         await client.post(
             f"{TELEGRAM_BASE}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
             timeout=10,
         )
+
+# ─── Telegram ───────────────────────────────────────────────────────────────
+
+async def send_telegram(chat_id: int, text: str) -> None:
+    await send_telegram_to(chat_id, text)
 
 async def handle_message(chat_id: int, text: str) -> None:
     try:
@@ -520,13 +636,18 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.error(f"Session başlatılamadı: {exc}")
 
+    # Sosyal medya
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=10, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=14, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=20, minute=0))
     scheduler.add_job(scheduled_reels,    CronTrigger(hour=20, minute=30))
     scheduler.add_job(scheduled_story,    CronTrigger(hour=0,  minute=0))
+
+    # Trendyol sipariş kontrolü — her 5 dakika
+    scheduler.add_job(check_new_orders, IntervalTrigger(minutes=5))
+
     scheduler.start()
-    log.info("⏰ Carousel 10:00/14:00/20:00 | Reels 20:30 (IG) | Story 00:00 (TR)")
+    log.info("⏰ Carousel 10:00/14:00/20:00 | Reels 20:30 | Story 00:00 | Sipariş her 5dk (TR)")
 
     yield
     scheduler.shutdown()
@@ -567,6 +688,11 @@ async def webhook(request: Request, background: BackgroundTasks):
     if text.startswith("/story_now"):
         background.add_task(scheduled_story)
         await send_telegram(chat_id, "📖 Story paylaşımı başlatıldı...")
+        return JSONResponse({"ok": True})
+
+    if text.startswith("/check_orders"):
+        background.add_task(check_new_orders)
+        await send_telegram(chat_id, "🔍 Sipariş kontrolü başlatıldı...")
         return JSONResponse({"ok": True})
 
     background.add_task(handle_message, chat_id, text)
