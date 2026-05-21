@@ -35,7 +35,7 @@ CLAUDE_HEADERS = {
 }
 
 POLL_INTERVAL = 2
-POLL_TIMEOUT  = 120
+POLL_TIMEOUT  = 750
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
