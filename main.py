@@ -125,18 +125,15 @@ def load_supplier_data():
 def match_supplier(barcode: str) -> str:
     return BARCODE_SUPPLIER_MAP.get(str(barcode).strip(), "")
 
-
 def get_product_image(barcode: str) -> str:
     return BARCODE_IMAGE_MAP.get(str(barcode).strip(), "")
-
 
 def get_supplier_for_chat(chat_id: int) -> str:
     return CHAT_SUPPLIER_MAP.get(chat_id, "")
 
-# ─── Ürün durum sorguları ────────────────────────────────────────────────────
+# ─── Ürün sorgulama fonksiyonları ────────────────────────────────────────────
 
 def get_passive_products() -> str:
-    """Excel'den pasif ürünleri listeler."""
     try:
         df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
         if "Durum" not in df.columns:
@@ -151,14 +148,12 @@ def get_passive_products() -> str:
         lines = [f"📦 *Pasif Ürünler* ({len(passive)} adet)\n"]
         for _, row in passive.iterrows():
             lines.append(f"• {row['Ürün Adı'][:60]}")
-
         return "\n".join(lines)
     except Exception as e:
         return f"❌ Hata: {e}"
 
 
 def get_stopped_products() -> str:
-    """Excel'den satışı durdurulan ürünleri ve açıklamalarını listeler."""
     try:
         df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
         if "Durum" not in df.columns:
@@ -166,25 +161,37 @@ def get_stopped_products() -> str:
 
         aciklama_col = "Durum Açıklaması" if "Durum Açıklaması" in df.columns else None
 
-        stopped = df[
-            df["Durum"].astype(str).str.lower().isin(["pasif", "passive", "0", "false"]) |
-            (df["Durum Açıklaması"].astype(str).str.len() > 2 if aciklama_col else False)
-        ]
-        stopped = stopped.drop_duplicates(subset=["Model Kodu"])
-
         if aciklama_col:
-            stopped = stopped[stopped["Durum Açıklaması"].astype(str).str.strip().str.len() > 2]
+            stopped = df[df[aciklama_col].astype(str).str.strip().str.len() > 2]
+        else:
+            stopped = df[df["Durum"].astype(str).str.lower().isin(["pasif", "passive", "0", "false"])]
+
+        stopped = stopped.drop_duplicates(subset=["Model Kodu"])
 
         if stopped.empty:
             return "✅ Satışı durdurulan ürün bulunmuyor."
 
         lines = [f"🚫 *Satışı Durdurulan Ürünler* ({len(stopped)} adet)\n"]
         for _, row in stopped.iterrows():
-            aciklama = str(row.get("Durum Açıklaması", "")).strip() if aciklama_col else "—"
+            aciklama = str(row.get(aciklama_col, "")).strip() if aciklama_col else "—"
             if not aciklama or aciklama in ("nan", "None", ""):
                 aciklama = "Açıklama yok"
             lines.append(f"• *{row['Ürün Adı'][:55]}*\n  📝 Sebep: {aciklama}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Hata: {e}"
 
+
+def get_new_products(n: int = 10) -> str:
+    try:
+        df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
+        unique = df.drop_duplicates(subset=["Model Kodu"])
+        son = unique.tail(n).iloc[::-1]  # en sondaki en yeni
+        fiyat_col = "Trendyol'da Satılacak Fiyat (KDV Dahil)"
+        lines = [f"🆕 *Son Eklenen {n} Ürün*\n"]
+        for i, (_, row) in enumerate(son.iterrows(), 1):
+            fiyat = row.get(fiyat_col, "")
+            lines.append(f"{i}. {row['Ürün Adı'][:55]} — {fiyat}₺")
         return "\n".join(lines)
     except Exception as e:
         return f"❌ Hata: {e}"
@@ -198,6 +205,27 @@ def is_passive_products_request(text: str) -> bool:
 def is_stopped_products_request(text: str) -> bool:
     keywords = ["satışı durdur", "satışı durdurul", "durdurulmuş", "satıştan kaldır", "satıştan kaldırıl"]
     return any(kw in text.lower() for kw in keywords)
+
+
+def is_new_products_request(text: str) -> bool:
+    keywords = ["yeni ürün", "son eklenen", "en son eklenen", "yeni eklenen"]
+    return any(kw in text.lower() for kw in keywords)
+
+
+def is_order_report_request(text: str) -> bool:
+    exclude = ["iptal", "iade", "neden", "sebep", "müşteri", "şikayet",
+               "pasif", "durdurul", "durdur", "kaldırıl", "yeni ürün",
+               "son eklenen", "yeni eklenen"]
+    if any(kw in text.lower() for kw in exclude):
+        return False
+    keywords = ["sipariş", "satış", "rapor", "özet", "kazanç", "kâr",
+                "gelir", "ciro", "kaç sipariş", "kaç satış"]
+    return any(kw in text.lower() for kw in keywords)
+
+
+def is_excel_request(text: str) -> bool:
+    keywords = ["excel", "xlsx", "dosya", "indir", "tablo"]
+    return any(kw in text.lower() for kw in keywords) and is_order_report_request(text)
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
@@ -531,22 +559,6 @@ def extract_days(text: str) -> int:
     if match:
         return min(int(match.group(1)), 30)
     return 3
-
-
-def is_order_report_request(text: str) -> bool:
-    # İptal/iade/pasif sorguları agent'a gitsin
-    exclude = ["iptal", "iade", "neden", "sebep", "müşteri", "şikayet",
-               "pasif", "durdurul", "durdur", "kaldırıl"]
-    if any(kw in text.lower() for kw in exclude):
-        return False
-    keywords = ["sipariş", "satış", "rapor", "özet", "kazanç", "kâr",
-                "gelir", "ciro", "kaç sipariş", "kaç satış"]
-    return any(kw in text.lower() for kw in keywords)
-
-
-def is_excel_request(text: str) -> bool:
-    keywords = ["excel", "xlsx", "dosya", "indir", "tablo"]
-    return any(kw in text.lower() for kw in keywords) and is_order_report_request(text)
 
 # ─── Telegram mesaj gönderme ─────────────────────────────────────────────────
 
@@ -965,28 +977,33 @@ async def handle_order_report(chat_id: int, text: str) -> None:
 
 async def handle_message(chat_id: int, text: str) -> None:
     try:
-        # Pasif ürün sorgusu
+        # 1) Yeni ürün sorgusu
+        if is_new_products_request(text):
+            await send_telegram(chat_id, get_new_products())
+            return
+
+        # 2) Pasif ürün sorgusu
         if is_passive_products_request(text):
             await send_telegram(chat_id, get_passive_products())
             return
 
-        # Satışı durdurulan ürün sorgusu
+        # 3) Satışı durdurulan ürün sorgusu
         if is_stopped_products_request(text):
             await send_telegram(chat_id, get_stopped_products())
             return
 
-        # Sipariş raporu
+        # 4) Sipariş raporu
         if is_order_report_request(text):
             await handle_order_report(chat_id, text)
             return
 
-        # Kısıtlı tedarikçi → agent'a yönlendirme yapma
+        # 5) Kısıtlı tedarikçi → agent'a yönlendirme yapma
         supplier_filter = get_supplier_for_chat(chat_id)
         if supplier_filter:
             await send_telegram(chat_id, "⚠️ Sadece sipariş ve satış raporları için komut gönderebilirsiniz.")
             return
 
-        # Agent'a gönder
+        # 6) Agent'a gönder
         reply = await ask_claude(text)
         await send_telegram(chat_id, reply)
 
