@@ -873,15 +873,18 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.error(f"Session başlatılamadı: {exc}")
 
-    scheduler.add_job(scheduled_carousel, CronTrigger(hour=10, minute=0))
-    scheduler.add_job(scheduled_carousel, CronTrigger(hour=14, minute=0))
-    scheduler.add_job(scheduled_carousel, CronTrigger(hour=20, minute=0))
-    scheduler.add_job(scheduled_reels,    CronTrigger(hour=20, minute=30))
-    scheduler.add_job(scheduled_story,    CronTrigger(hour=0,  minute=0))
+    scheduler.add_job(scheduled_carousel, CronTrigger(hour=9, minute=0))
+    scheduler.add_job(scheduled_carousel, CronTrigger(hour=12, minute=0))
+    scheduler.add_job(scheduled_carousel, CronTrigger(hour=16, minute=0))
+    scheduler.add_job(scheduled_carousel, CronTrigger(hour=21, minute=0))
+    scheduler.add_job(scheduled_reels,    CronTrigger(hour=10, minute=30))
+    scheduler.add_job(scheduled_reels,    CronTrigger(hour=19, minute=0))
+    scheduler.add_job(scheduled_story,    CronTrigger(hour=14, minute=0))
+    scheduler.add_job(scheduled_story,    CronTrigger(hour=23, minute=0))
     scheduler.add_job(check_new_orders,   IntervalTrigger(minutes=5))
 
     scheduler.start()
-    log.info("⏰ Carousel 10:00/14:00/20:00 | Reels 20:30 | Story 00:00 | Sipariş her 5dk (TR)")
+    log.info("⏰ Carousel 09:00/12:00/16:00/21:00 | Reels 10:30/19:00 | Story 14:00/23:00 | Sipariş her 5dk (TR)")
 
     yield
     scheduler.shutdown()
