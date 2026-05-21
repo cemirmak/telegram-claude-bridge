@@ -5,3 +5,4 @@ faster-whisper==1.0.3
 fastapi
 uvicorn
 httpx
+apscheduler
