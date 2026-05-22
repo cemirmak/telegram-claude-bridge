@@ -392,8 +392,9 @@ def is_dashboard_request(text: str) -> bool:
 
 
 def is_approve_claims_request(text: str) -> bool:
-    keywords = ["iadeleri onayla", "iadeyi onayla", "iadeleri kabul", "toplu onayla"]
-    return any(kw in text.lower() for kw in keywords)
+    keywords = ["iadeleri onayla", "iadeyi onayla", "iadeleri kabul", "toplu onayla", "iadeleri onayla"]
+    text_lower = text.lower().strip()
+    return any(kw in text_lower for kw in keywords)
 
 
 def is_pending_questions_request(text: str) -> bool:
@@ -940,7 +941,7 @@ Lütfen hazırlayınız ✅"""
             _notified_orders = set(list(_notified_orders)[-500:])
 
 async def check_new_claims():
-    """Her 5 dakikada yeni WaitingInAction iadeleri kontrol eder."""
+    """Her 5 dakikada yeni WaitingInAction iadeleri kontrol eder. 5+ iade varsa otomatik onaylar."""
     global _notified_claims
 
     if not TRENDYOL_API_KEY or not TRENDYOL_API_SECRET:
@@ -950,6 +951,7 @@ async def check_new_claims():
     if not claims:
         return
 
+    # Yeni iadeleri bildir
     for claim in claims:
         claim_id = str(claim.get("id", ""))
         if not claim_id or claim_id in _notified_claims:
@@ -957,30 +959,49 @@ async def check_new_claims():
 
         order_no = claim.get("orderNumber", "—")
         items    = claim.get("claimItems", claim.get("items", []))
-        product  = ""
-        reason   = ""
+        reason   = "—"
         amount   = 0.0
         if items:
-            first   = items[0]
-            product = first.get("productName", first.get("productSize", "—"))
-            reason  = first.get("customerClaimReason", first.get("claimReason", "—"))
-            amount  = first.get("price", first.get("amount", 0))
+            first  = items[0]
+            reason = first.get("customerClaimReason", first.get("claimReason", "—"))
+            amount = first.get("price", first.get("amount", 0))
 
-        msg = f"""🔄 *Yeni İade Talebi!*
-
-🏪 Sipariş No: #{order_no}
-📦 Ürün: {str(product)[:55]}
-📝 Sebep: {reason}
-💰 Tutar: {float(amount):.2f}₺
-
-⚡ Onaylamak için: *iadeleri onayla*"""
-
+        msg = (
+            f"🔄 *Yeni İade Talebi!*\n\n"
+            f"🏪 Sipariş No: #{order_no}\n"
+            f"📝 Sebep: {reason}\n"
+            f"💰 Tutar: {float(amount):.2f}₺\n\n"
+            f"⚡ Onaylamak için: *iadeleri onayla*"
+        )
         await notify_telegram(msg)
         _notified_claims.add(claim_id)
         log.info(f"İade bildirimi gönderildi: {claim_id}")
 
-        if len(_notified_claims) > 500:
-            _notified_claims = set(list(_notified_claims)[-250:])
+    if len(_notified_claims) > 500:
+        _notified_claims = set(list(_notified_claims)[-250:])
+
+    # 5 veya daha fazla bekleyen iade varsa otomatik onayla
+    if len(claims) >= 5:
+        log.info(f"Otomatik onay: {len(claims)} bekleyen iade")
+        success = 0
+        fail    = 0
+        for claim in claims:
+            claim_id = str(claim.get("id", ""))
+            items    = claim.get("claimItems", claim.get("items", []))
+            line_ids = [item.get("id") for item in items if item.get("id")]
+            if claim_id and line_ids:
+                ok = await approve_claim(claim_id, line_ids)
+                if ok:
+                    success += 1
+                else:
+                    fail += 1
+
+        await notify_telegram(
+            f"✅ *Otomatik İade Onayı*\n\n"
+            f"• Toplam: {len(claims)}\n"
+            f"• Onaylanan: {success}\n"
+            f"• Hatalı: {fail}"
+        )
 
 
 
