@@ -700,22 +700,42 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
 
 
 async def instagram_reels_post(video_url: str, caption: str) -> dict:
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
             params={"media_type": "REELS", "video_url": video_url,
                     "caption": caption, "access_token": META_ACCESS_TOKEN},
         )
         if r.status_code != 200:
+            log.error(f"Instagram Reels container hatası: {r.status_code} {r.text}")
             return {"error": r.text}
         data = r.json()
         if "id" not in data:
             return {"error": str(data)}
-        await asyncio.sleep(30)
+
+        creation_id = data["id"]
+        log.info(f"Instagram Reels container oluşturuldu: {creation_id}")
+
+        # Video işlenene kadar bekle (max 90 saniye)
+        for attempt in range(18):
+            await asyncio.sleep(5)
+            r = await client.get(
+                f"{GRAPH_BASE}/{creation_id}",
+                params={"fields": "status_code", "access_token": META_ACCESS_TOKEN},
+            )
+            status = r.json().get("status_code", "")
+            log.info(f"Instagram Reels durum ({attempt+1}/18): {status}")
+            if status == "FINISHED":
+                break
+            if status == "ERROR":
+                return {"error": "Video işleme hatası"}
+
         r = await client.post(
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
-            params={"creation_id": data["id"], "access_token": META_ACCESS_TOKEN},
+            params={"creation_id": creation_id, "access_token": META_ACCESS_TOKEN},
         )
+        if r.status_code != 200:
+            log.error(f"Instagram Reels publish hatası: {r.status_code} {r.text}")
         return r.json()
 
 
