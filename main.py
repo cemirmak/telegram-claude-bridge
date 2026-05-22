@@ -251,11 +251,13 @@ async def get_instagram_insights(days: int = 1) -> dict:
             total_comments    = 0
 
             for media in media_list:
-                total_likes    += media.get("like_count", 0) or 0
-                total_comments += media.get("comments_count", 0) or 0
-                # Video view count reels/video için
-                views = media.get("video_view_count", 0) or 0
-                total_impressions += views
+                lk = media.get("like_count", 0) or 0
+                cm = media.get("comments_count", 0) or 0
+                vw = media.get("video_view_count", 0) or 0
+                log.info(f"Medya {media.get('media_type')} like:{lk} yorum:{cm} view:{vw} keys:{list(media.keys())}")
+                total_likes       += lk
+                total_comments    += cm
+                total_impressions += vw
 
         return {
             "followers":    account.get("followers_count", "—"),
