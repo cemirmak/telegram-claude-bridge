@@ -219,12 +219,10 @@ def is_excel_request(text: str) -> bool:
 # ─── Sosyal Medya İstatistikleri ─────────────────────────────────────────────
 
 async def get_instagram_insights(days: int = 1) -> dict:
-    """Instagram hesap istatistiklerini çeker — son N günün toplamı."""
-    since = int((datetime.now() - timedelta(days=days)).timestamp())
-    until = int(datetime.now().timestamp())
-    metrics = "impressions,reach,profile_views,follower_count"
+    """Instagram istatistiklerini çeker — son N günün medyalarından toplar."""
+    since_ts = int((datetime.now() - timedelta(days=days)).timestamp())
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             # Hesap bilgileri
             r = await client.get(
                 f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}",
@@ -232,34 +230,56 @@ async def get_instagram_insights(days: int = 1) -> dict:
             )
             account = r.json()
 
-            # Insights — günlük periyot, tarih aralığı ile
+            # Son N gündeki medyaları çek
             r = await client.get(
-                f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/insights",
+                f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
                 params={
-                    "metric":  metrics,
-                    "period":  "day",
-                    "since":   since,
-                    "until":   until,
+                    "fields": "id,timestamp,media_type",
+                    "since":  since_ts,
+                    "limit":  50,
                     "access_token": META_ACCESS_TOKEN,
                 },
             )
-            insights_data = r.json().get("data", [])
+            media_list = r.json().get("data", [])
 
-        result = {
+            # Her medyanın insights'ını topla
+            total_impressions = 0
+            total_reach       = 0
+            total_likes       = 0
+            total_comments    = 0
+
+            for media in media_list:
+                media_id = media.get("id")
+                if not media_id:
+                    continue
+                r2 = await client.get(
+                    f"{GRAPH_BASE}/{media_id}/insights",
+                    params={
+                        "metric": "impressions,reach,likes,comments",
+                        "access_token": META_ACCESS_TOKEN,
+                    },
+                )
+                for item in r2.json().get("data", []):
+                    name  = item.get("name", "")
+                    value = item.get("values", [{}])[0].get("value", 0) if item.get("values") else item.get("value", 0)
+                    if name == "impressions":
+                        total_impressions += value
+                    elif name == "reach":
+                        total_reach += value
+                    elif name == "likes":
+                        total_likes += value
+                    elif name == "comments":
+                        total_comments += value
+
+        return {
             "followers":     account.get("followers_count", "—"),
             "media_count":   account.get("media_count", "—"),
-            "impressions":   0,
-            "reach":         0,
-            "profile_views": 0,
+            "impressions":   total_impressions,
+            "reach":         total_reach,
+            "likes":         total_likes,
+            "comments":      total_comments,
+            "post_count":    len(media_list),
         }
-        for item in insights_data:
-            name = item.get("name", "")
-            if name in result:
-                # Tüm günlerin değerlerini topla
-                total = sum(v.get("value", 0) for v in item.get("values", []))
-                result[name] = total
-
-        return result
     except Exception as e:
         log.error(f"Instagram insights hatası: {e}")
         return {}
@@ -272,14 +292,12 @@ async def get_facebook_insights(days: int = 1) -> dict:
     metrics = "page_impressions,page_reach,page_post_engagements,page_views_total"
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            # Sayfa bilgileri
             r = await client.get(
                 f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}",
                 params={"fields": "fan_count,followers_count", "access_token": FACEBOOK_ACCESS_TOKEN},
             )
             page = r.json()
 
-            # Insights
             r = await client.get(
                 f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/insights",
                 params={
@@ -337,9 +355,11 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 📸 *Instagram*
 • Takipçi: {ig.get('followers', '—')}
 • Toplam Gönderi: {ig.get('media_count', '—')}
+• Dönemdeki Gönderi: {ig.get('post_count', 0)}
 • Gösterim: {ig.get('impressions', 0):,}
 • Erişim: {ig.get('reach', 0):,}
-• Profil Ziyareti: {ig.get('profile_views', 0):,}
+• Beğeni: {ig.get('likes', 0):,}
+• Yorum: {ig.get('comments', 0):,}
 
 📘 *Facebook*
 • Takipçi: {fb.get('followers_count', '—')}
