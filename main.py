@@ -5,7 +5,7 @@ Render.com'da çalışır (FastAPI + httpx + APScheduler)
 Zamanlama (TR saati):
   Her 5 dakika               → Trendyol yeni sipariş kontrolü + tedarikçi bildirimi
   09:00, 12:00, 16:00, 21:00 → Carousel post (Instagram + Facebook)
-  10:30, 19:00               → Reels (sadece Instagram)
+  10:30, 19:00               → Reels (Instagram + Facebook)
   14:00, 23:00               → Story (Instagram + Facebook)
 """
 
@@ -138,13 +138,10 @@ def get_passive_products() -> str:
         df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
         if "Durum" not in df.columns:
             return "❌ Excel'de 'Durum' kolonu bulunamadı."
-
         passive = df[df["Durum"].astype(str).str.lower().isin(["pasif", "passive", "0", "false"])]
         passive = passive.drop_duplicates(subset=["Model Kodu"])
-
         if passive.empty:
             return "✅ Pasif ürün bulunmuyor."
-
         lines = [f"📦 *Pasif Ürünler* ({len(passive)} adet)\n"]
         for _, row in passive.iterrows():
             lines.append(f"• {row['Ürün Adı'][:60]}")
@@ -158,19 +155,14 @@ def get_stopped_products() -> str:
         df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
         if "Durum" not in df.columns:
             return "❌ Excel'de 'Durum' kolonu bulunamadı."
-
         aciklama_col = "Durum Açıklaması" if "Durum Açıklaması" in df.columns else None
-
         if aciklama_col:
             stopped = df[df[aciklama_col].astype(str).str.strip().str.len() > 2]
         else:
             stopped = df[df["Durum"].astype(str).str.lower().isin(["pasif", "passive", "0", "false"])]
-
         stopped = stopped.drop_duplicates(subset=["Model Kodu"])
-
         if stopped.empty:
             return "✅ Satışı durdurulan ürün bulunmuyor."
-
         lines = [f"🚫 *Satışı Durdurulan Ürünler* ({len(stopped)} adet)\n"]
         for _, row in stopped.iterrows():
             aciklama = str(row.get(aciklama_col, "")).strip() if aciklama_col else "—"
@@ -186,7 +178,7 @@ def get_new_products(n: int = 10) -> str:
     try:
         df = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
         unique = df.drop_duplicates(subset=["Model Kodu"])
-        son = unique.tail(n).iloc[::-1]  # en sondaki en yeni
+        son = unique.tail(n).iloc[::-1]
         fiyat_col = "Trendyol'da Satılacak Fiyat (KDV Dahil)"
         lines = [f"🆕 *Son Eklenen {n} Ürün*\n"]
         for i, (_, row) in enumerate(son.iterrows(), 1):
@@ -201,16 +193,13 @@ def is_passive_products_request(text: str) -> bool:
     keywords = ["pasif ürün", "pasif", "aktif değil", "yayında olmayan"]
     return any(kw in text.lower() for kw in keywords)
 
-
 def is_stopped_products_request(text: str) -> bool:
     keywords = ["satışı durdur", "satışı durdurul", "durdurulmuş", "satıştan kaldır", "satıştan kaldırıl"]
     return any(kw in text.lower() for kw in keywords)
 
-
 def is_new_products_request(text: str) -> bool:
     keywords = ["yeni ürün", "son eklenen", "en son eklenen", "yeni eklenen"]
     return any(kw in text.lower() for kw in keywords)
-
 
 def is_order_report_request(text: str) -> bool:
     exclude = ["iptal", "iade", "neden", "sebep", "müşteri", "şikayet",
@@ -221,7 +210,6 @@ def is_order_report_request(text: str) -> bool:
     keywords = ["sipariş", "satış", "rapor", "özet", "kazanç", "kâr",
                 "gelir", "ciro", "kaç sipariş", "kaç satış"]
     return any(kw in text.lower() for kw in keywords)
-
 
 def is_excel_request(text: str) -> bool:
     keywords = ["excel", "xlsx", "dosya", "indir", "tablo"]
@@ -767,6 +755,101 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
         return r.json()
 
 
+async def facebook_reels_post(video_url: str, caption: str) -> dict:
+    """
+    Facebook Reels binary upload:
+    1. Videoyu indir
+    2. Upload session aç
+    3. Binary olarak yükle
+    4. Yayınla
+    """
+    try:
+        # 1) Videoyu indir
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(video_url, follow_redirects=True)
+            if r.status_code != 200:
+                log.error(f"Video indirilemedi: {r.status_code}")
+                return {"error": f"Video indirilemedi: {r.status_code}"}
+            video_bytes = r.content
+            file_size   = len(video_bytes)
+            log.info(f"Video indirildi: {file_size / 1024 / 1024:.1f} MB")
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            # 2) Upload session başlat
+            r = await client.post(
+                f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
+                params={
+                    "upload_phase": "start",
+                    "access_token": FACEBOOK_ACCESS_TOKEN,
+                },
+            )
+            if r.status_code != 200:
+                log.error(f"Facebook Reels start hatası: {r.status_code} {r.text}")
+                return {"error": r.text}
+
+            data     = r.json()
+            video_id = data.get("video_id")
+            upload_url = data.get("upload_url", "")
+
+            if not video_id:
+                return {"error": str(data)}
+
+            log.info(f"Facebook Reels video_id: {video_id}")
+
+            # 3) Binary upload
+            if upload_url:
+                # upload_url varsa direkt oraya yükle
+                r = await client.post(
+                    upload_url,
+                    content=video_bytes,
+                    headers={
+                        "Authorization": f"OAuth {FACEBOOK_ACCESS_TOKEN}",
+                        "Content-Type": "video/mp4",
+                        "file_size": str(file_size),
+                        "start_offset": "0",
+                    },
+                )
+            else:
+                # Yoksa transfer endpoint'e yükle
+                r = await client.post(
+                    f"https://rupload.facebook.com/video-upload/v19.0/{video_id}",
+                    content=video_bytes,
+                    headers={
+                        "Authorization": f"OAuth {FACEBOOK_ACCESS_TOKEN}",
+                        "Content-Type": "video/mp4",
+                        "file_size": str(file_size),
+                        "start_offset": "0",
+                    },
+                )
+
+            if r.status_code not in (200, 201):
+                log.error(f"Facebook Reels upload hatası: {r.status_code} {r.text}")
+                return {"error": r.text}
+
+            log.info("Video yüklendi, yayınlanıyor...")
+
+            # 4) Finish — yayınla
+            r = await client.post(
+                f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
+                params={
+                    "upload_phase":  "finish",
+                    "video_id":      video_id,
+                    "description":   caption,
+                    "video_state":   "PUBLISHED",
+                    "access_token":  FACEBOOK_ACCESS_TOKEN,
+                },
+            )
+            if r.status_code != 200:
+                log.error(f"Facebook Reels finish hatası: {r.status_code} {r.text}")
+            result = r.json()
+            log.info(f"Facebook Reels yayınlandı: {result}")
+            return result
+
+    except Exception as e:
+        log.error(f"Facebook Reels exception: {e}")
+        return {"error": str(e)}
+
+
 async def facebook_story_post(image_url: str) -> dict:
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
@@ -918,8 +1001,11 @@ async def scheduled_reels():
 
     caption = await generate_caption(product)
     ig = await instagram_reels_post(product["video_url"], caption)
+    fb = await facebook_reels_post(product["video_url"], caption)
+
     ig_ok = "id" in str(ig) and "error" not in ig
-    await notify_telegram(f"🎬 *Reels*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'}")
+    fb_ok = "id" in str(fb) and "error" not in fb
+    await notify_telegram(f"🎬 *Reels*\n{product['name']}\nIG: {'✅' if ig_ok else '❌'} | FB: {'✅' if fb_ok else '❌'}")
 
 
 async def scheduled_story():
@@ -977,33 +1063,27 @@ async def handle_order_report(chat_id: int, text: str) -> None:
 
 async def handle_message(chat_id: int, text: str) -> None:
     try:
-        # 1) Yeni ürün sorgusu
         if is_new_products_request(text):
             await send_telegram(chat_id, get_new_products())
             return
 
-        # 2) Pasif ürün sorgusu
         if is_passive_products_request(text):
             await send_telegram(chat_id, get_passive_products())
             return
 
-        # 3) Satışı durdurulan ürün sorgusu
         if is_stopped_products_request(text):
             await send_telegram(chat_id, get_stopped_products())
             return
 
-        # 4) Sipariş raporu
         if is_order_report_request(text):
             await handle_order_report(chat_id, text)
             return
 
-        # 5) Kısıtlı tedarikçi → agent'a yönlendirme yapma
         supplier_filter = get_supplier_for_chat(chat_id)
         if supplier_filter:
             await send_telegram(chat_id, "⚠️ Sadece sipariş ve satış raporları için komut gönderebilirsiniz.")
             return
 
-        # 6) Agent'a gönder
         reply = await ask_claude(text)
         await send_telegram(chat_id, reply)
 
