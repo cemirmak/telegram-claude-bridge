@@ -607,7 +607,12 @@ async def fetch_pending_claims() -> list:
         if r.status_code != 200:
             log.warning(f"İade listesi hatası: {r.status_code} {r.text[:200]}")
             return []
-        return r.json().get("content", [])
+        data    = r.json()
+        content = data.get("content", [])
+        if content:
+            log.info(f"İlk iade örneği: {json.dumps(content[0], ensure_ascii=False)[:500]}")
+        log.info(f"Toplam iade: {len(content)}")
+        return content
     except Exception as e:
         log.error(f"İade fetch hatası: {e}")
         return []
