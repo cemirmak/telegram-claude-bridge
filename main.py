@@ -388,13 +388,22 @@ async def fetch_new_orders() -> list:
 # ─── Kâr hesabı ─────────────────────────────────────────────────────────────
 
 def calculate_profit(total_amount: float, total_orders: int, total_qty: int) -> dict:
-    komisyon = total_amount * 0.215
-    kargo    = total_orders * 60
-    brut_kar = total_amount - komisyon - kargo
-    ms_kar   = brut_kar * 0.45
-    kdv      = ms_kar * 0.10
-    net_kar  = ms_kar - kdv
-    return {"komisyon": komisyon, "kargo": kargo, "kdv": kdv, "net_kar": net_kar}
+    komisyon    = total_amount * 0.215
+    kargo       = total_orders * 60
+    brut_kar    = total_amount - komisyon - kargo
+    maliyet     = brut_kar * 0.60
+    vergisiz_kar = brut_kar - maliyet
+    kdv         = vergisiz_kar * 0.10
+    kalan_kar   = vergisiz_kar - kdv
+    kazanc      = brut_kar - kalan_kar
+    return {
+        "komisyon":     komisyon,
+        "kargo":        kargo,
+        "brut_kar":     brut_kar,
+        "kdv":          kdv,
+        "kalan_kar":    kalan_kar,
+        "kazanc":       kazanc,
+    }
 
 # ─── Rapor oluşturma ─────────────────────────────────────────────────────────
 
@@ -463,11 +472,10 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 💰 *Finansal*
 • Toplam Sipariş: {total_orders} paket
 • Toplam Satış: {total_amount:.2f}₺
-• Trendyol Komisyonu (%21.5): -{profit['komisyon']:.2f}₺
-• Kargo Gideri (60₺/sipariş): -{profit['kargo']:.2f}₺
-• KDV: -{profit['kdv']:.2f}₺
-• Net Kâr: {profit['net_kar']:.2f}₺
+• Komisyon (%21.5): -{profit['komisyon']:.2f}₺
+• Kargo ({total_orders} × 60₺): -{profit['kargo']:.2f}₺
 • İade/İptal: {returned + cancelled} adet
+• Kazanç: {profit['kazanc']:.2f}₺
 {supplier_section}
 🏆 *En Çok Satan 5 Ürün*
 {chr(10).join(top5_lines)}
