@@ -76,6 +76,7 @@ _posted_today: set         = set()
 _posted_date: str          = ""
 _notified_orders: set      = set()
 _notified_claims: set      = set()
+_notified_questions: set   = set()
 SUPPLIER_DATA: list        = []
 BARCODE_SUPPLIER_MAP: dict = {}
 BARCODE_IMAGE_MAP: dict    = {}
@@ -944,6 +945,93 @@ async def check_new_claims():
             _notified_claims = set(list(_notified_claims)[-250:])
 
 
+
+
+# ─── Trendyol Müşteri Soruları ───────────────────────────────────────────────
+
+async def fetch_pending_questions() -> list:
+    """Cevap bekleyen müşteri sorularını çeker."""
+    url = f"{TRENDYOL_BASE}/qna/sellers/{TRENDYOL_SUPPLIER_ID}/questions/filter"
+    params = {"status": "WAITING_FOR_ANSWER", "size": 50, "page": 0}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, headers=get_trendyol_headers(), params=params)
+        if r.status_code != 200:
+            log.warning(f"Soru listesi hatası: {r.status_code} {r.text[:200]}")
+            return []
+        data = r.json()
+        return data.get("content", data.get("questionList", []))
+    except Exception as e:
+        log.error(f"Soru fetch hatası: {e}")
+        return []
+
+
+async def answer_question(question_id: str, answer_text: str) -> bool:
+    """Müşteri sorusunu cevaplar."""
+    url = f"{TRENDYOL_BASE}/qna/sellers/{TRENDYOL_SUPPLIER_ID}/questions/{question_id}/answers"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                url,
+                headers=get_trendyol_headers(),
+                json={"text": answer_text},
+            )
+        if r.status_code in (200, 201, 204):
+            log.info(f"Soru cevaplandı: {question_id}")
+            return True
+        log.error(f"Soru cevaplama hatası: {r.status_code} {r.text}")
+        return False
+    except Exception as e:
+        log.error(f"Soru cevaplama exception: {e}")
+        return False
+
+
+async def check_new_questions():
+    """Her 5 dakikada yeni müşteri sorularını kontrol eder."""
+    global _notified_questions
+
+    if not TRENDYOL_API_KEY or not TRENDYOL_API_SECRET:
+        return
+
+    questions = await fetch_pending_questions()
+    if not questions:
+        return
+
+    for q in questions:
+        q_id = str(q.get("id", ""))
+        if not q_id or q_id in _notified_questions:
+            continue
+
+        product_name = q.get("productName", q.get("product", {}).get("name", "—"))
+        question_text = q.get("text", q.get("questionText", "—"))
+        customer_name = q.get("customerName", q.get("userName", "Müşteri"))
+        created_date  = q.get("createdDate", "")
+        if created_date:
+            try:
+                dt = datetime.fromtimestamp(created_date / 1000)
+                created_date = dt.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                pass
+
+        msg = f"""❓ *Yeni Müşteri Sorusu!*
+
+📦 Ürün: {str(product_name)[:55]}
+👤 Müşteri: {customer_name}
+🕐 Tarih: {created_date}
+
+💬 Soru:
+_{str(question_text)[:500]}_
+
+🆔 Soru ID: `{q_id}`
+💡 Cevap için: *cevap: {q_id}: Cevabınız buraya*"""
+
+        await notify_telegram(msg)
+        _notified_questions.add(q_id)
+        log.info(f"Soru bildirimi gönderildi: {q_id}")
+
+        if len(_notified_questions) > 500:
+            _notified_questions = set(list(_notified_questions)[-250:])
+
 # ─── ImgBB ──────────────────────────────────────────────────────────────────
 
 async def upload_to_imgbb(image_url: str) -> str:
@@ -1467,9 +1555,10 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(scheduled_story,    CronTrigger(hour=23, minute=0))
     scheduler.add_job(check_new_orders,   IntervalTrigger(minutes=5))
     scheduler.add_job(check_new_claims,    IntervalTrigger(minutes=5))
+    scheduler.add_job(check_new_questions,  IntervalTrigger(minutes=5))
 
     scheduler.start()
-    log.info("⏰ Carousel 09:00/12:00/15:00/21:00 | Reels 10:30/16:00/20:00 | Story 14:00/23:00 | Sipariş+İade her 5dk (TR)")
+    log.info("⏰ Carousel 09:00/12:00/15:00/21:00 | Reels 10:30/16:00/20:00 | Story 14:00/23:00 | Sipariş+İade+Soru her 5dk (TR)")
 
     yield
     scheduler.shutdown()
