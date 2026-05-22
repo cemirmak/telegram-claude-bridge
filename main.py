@@ -352,6 +352,16 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 _✅ Meta API verisi_"""
 
 
+def is_pending_claims_request(text: str) -> bool:
+    keywords = ["bekleyen iade", "iade listesi", "iade talebi", "aksiyon bekleyen"]
+    return any(kw in text.lower() for kw in keywords)
+
+
+def is_approve_claims_request(text: str) -> bool:
+    keywords = ["iadeleri onayla", "iadeyi onayla", "iadeleri kabul", "toplu onayla"]
+    return any(kw in text.lower() for kw in keywords)
+
+
 def is_insights_request(text: str) -> bool:
     keywords = ["istatistik", "etkileşim", "takipçi", "erişim", "gösterim", "analiz", "insight"]
     return any(kw in text.lower() for kw in keywords)
@@ -537,6 +547,76 @@ async def fetch_new_orders() -> list:
     except Exception as e:
         log.error(f"Trendyol fetch hatası: {e}")
         return []
+
+
+
+# ─── Trendyol İade İşlemleri ─────────────────────────────────────────────────
+
+async def fetch_pending_claims() -> list:
+    """WaitingInAction statüsündeki iadeleri çeker."""
+    url = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/claims"
+    params = {"status": "WaitingInAction", "size": 50, "page": 0}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, headers=get_trendyol_headers(), params=params)
+        if r.status_code != 200:
+            log.warning(f"İade listesi hatası: {r.status_code} {r.text[:200]}")
+            return []
+        return r.json().get("content", [])
+    except Exception as e:
+        log.error(f"İade fetch hatası: {e}")
+        return []
+
+
+async def approve_claim(claim_id: str, line_item_ids: list) -> bool:
+    """Belirli bir iadeyi onaylar."""
+    url = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/claims/{claim_id}/items/approve"
+    body = {"claimLineItemIdList": line_item_ids}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.put(url, headers=get_trendyol_headers(), json=body)
+        if r.status_code in (200, 201, 204):
+            log.info(f"İade onaylandı: {claim_id}")
+            return True
+        log.error(f"İade onaylama hatası: {r.status_code} {r.text}")
+        return False
+    except Exception as e:
+        log.error(f"İade onaylama exception: {e}")
+        return False
+
+
+def format_claims_message(claims: list) -> str:
+    """İade listesini Telegram mesajına çevirir."""
+    if not claims:
+        return "✅ Aksiyon bekleyen iade bulunmuyor."
+
+    lines = [f"📦 *Aksiyon Bekleyen İadeler* ({len(claims)} adet)
+"]
+    for claim in claims:
+        claim_id   = claim.get("id", "—")
+        order_no   = claim.get("orderNumber", "—")
+        items      = claim.get("claimItems", claim.get("items", []))
+        reason     = ""
+        product    = ""
+        if items:
+            first   = items[0]
+            reason  = first.get("customerClaimReason", first.get("claimReason", "—"))
+            product = first.get("productName", first.get("productSize", "—"))
+
+        lines.append(
+            f"🔸 Sipariş: #{order_no}
+"
+            f"   Ürün: {str(product)[:45]}
+"
+            f"   Sebep: {reason}
+"
+            f"   ID: `{claim_id}`"
+        )
+
+    lines.append("
+💡 Tümünü onaylamak için: *iadeleri onayla*")
+    return "
+".join(lines)
 
 # ─── Kâr hesabı ─────────────────────────────────────────────────────────────
 
@@ -1237,6 +1317,36 @@ async def handle_message(chat_id: int, text: str) -> None:
             await send_telegram(chat_id, "⏳ İstatistikler çekiliyor...")
             report = await get_combined_insights(days)
             await send_telegram(chat_id, report)
+            return
+
+        if is_pending_claims_request(text):
+            await send_telegram(chat_id, "⏳ İadeler çekiliyor...")
+            claims = await fetch_pending_claims()
+            await send_telegram(chat_id, format_claims_message(claims))
+            return
+
+        if is_approve_claims_request(text):
+            await send_telegram(chat_id, "⏳ İadeler onaylanıyor...")
+            claims = await fetch_pending_claims()
+            if not claims:
+                await send_telegram(chat_id, "✅ Onaylanacak iade bulunmuyor.")
+                return
+            success = 0
+            fail    = 0
+            for claim in claims:
+                claim_id = str(claim.get("id", ""))
+                items    = claim.get("claimItems", claim.get("items", []))
+                line_ids = [item.get("id") for item in items if item.get("id")]
+                if claim_id and line_ids:
+                    ok = await approve_claim(claim_id, line_ids)
+                    if ok:
+                        success += 1
+                    else:
+                        fail += 1
+            await send_telegram(chat_id, f"✅ *İade Onaylama Tamamlandı*
+
+• Onaylanan: {success}
+• Hatalı: {fail}")
             return
 
         if is_new_products_request(text):
