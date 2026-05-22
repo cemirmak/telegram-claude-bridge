@@ -610,7 +610,7 @@ async def fetch_pending_claims() -> list:
         data    = r.json()
         content = data.get("content", [])
         if content:
-            log.info(f"İlk iade örneği: {json.dumps(content[0], ensure_ascii=False)[:500]}")
+            log.info(f"İlk iade TAM JSON: {json.dumps(content[0], ensure_ascii=False)}")
         log.info(f"Toplam iade: {len(content)}")
         return content
     except Exception as e:
