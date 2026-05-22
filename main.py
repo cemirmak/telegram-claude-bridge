@@ -796,31 +796,19 @@ async def facebook_reels_post(video_url: str, caption: str) -> dict:
 
             log.info(f"Facebook Reels video_id: {video_id}")
 
-            # 3) Binary upload
-            if upload_url:
-                # upload_url varsa direkt oraya yükle
-                r = await client.post(
-                    upload_url,
-                    content=video_bytes,
-                    headers={
-                        "Authorization": f"OAuth {FACEBOOK_ACCESS_TOKEN}",
-                        "Content-Type": "video/mp4",
-                        "file_size": str(file_size),
-                        "start_offset": "0",
-                    },
-                )
-            else:
-                # Yoksa transfer endpoint'e yükle
-                r = await client.post(
-                    f"https://rupload.facebook.com/video-upload/v19.0/{video_id}",
-                    content=video_bytes,
-                    headers={
-                        "Authorization": f"OAuth {FACEBOOK_ACCESS_TOKEN}",
-                        "Content-Type": "video/mp4",
-                        "file_size": str(file_size),
-                        "start_offset": "0",
-                    },
-                )
+            # 3) Binary upload — rupload.facebook.com
+            upload_endpoint = upload_url if upload_url else f"https://rupload.facebook.com/video-upload/v19.0/{video_id}"
+            r = await client.post(
+                upload_endpoint,
+                content=video_bytes,
+                headers={
+                    "Authorization": f"OAuth {FACEBOOK_ACCESS_TOKEN}",
+                    "Content-Type": "video/mp4",
+                    "Content-Length": str(file_size),
+                    "offset": "0",
+                    "file_size": str(file_size),
+                },
+            )
 
             if r.status_code not in (200, 201):
                 log.error(f"Facebook Reels upload hatası: {r.status_code} {r.text}")
