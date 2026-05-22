@@ -615,8 +615,7 @@ def format_claims_message(claims: list) -> str:
     if not claims:
         return "✅ Aksiyon bekleyen iade bulunmuyor."
 
-    lines = [f"📦 *Aksiyon Bekleyen İadeler* ({len(claims)} adet)
-"]
+    lines = [f"📦 *Aksiyon Bekleyen İadeler* ({len(claims)} adet)\n"]
     for claim in claims:
         claim_id   = claim.get("id", "—")
         order_no   = claim.get("orderNumber", "—")
@@ -629,19 +628,14 @@ def format_claims_message(claims: list) -> str:
             product = first.get("productName", first.get("productSize", "—"))
 
         lines.append(
-            f"🔸 Sipariş: #{order_no}
-"
-            f"   Ürün: {str(product)[:45]}
-"
-            f"   Sebep: {reason}
-"
+            f"🔸 Sipariş: #{order_no}\n"
+            f"   Ürün: {str(product)[:45]}\n"
+            f"   Sebep: {reason}\n"
             f"   ID: `{claim_id}`"
         )
 
-    lines.append("
-💡 Tümünü onaylamak için: *iadeleri onayla*")
-    return "
-".join(lines)
+    lines.append("\n💡 Tümünü onaylamak için: *iadeleri onayla*")
+    return "\n".join(lines)
 
 # ─── Kâr hesabı ─────────────────────────────────────────────────────────────
 
@@ -1499,10 +1493,7 @@ async def handle_message(chat_id: int, text: str) -> None:
                         success += 1
                     else:
                         fail += 1
-            await send_telegram(chat_id, f"✅ *İade Onaylama Tamamlandı*
-
-• Onaylanan: {success}
-• Hatalı: {fail}")
+            await send_telegram(chat_id, f"✅ *İade Onaylama Tamamlandı*\n\n• Onaylanan: {success}\n• Hatalı: {fail}")
             return
 
         if is_new_products_request(text):
