@@ -630,28 +630,50 @@ async def approve_claim(claim_id: str, line_item_ids: list) -> bool:
 
 
 def format_claims_message(claims: list) -> str:
-    """İade listesini Telegram mesajına çevirir."""
+    """İade listesini Telegram mesajına çevirir — son 30 iade."""
     if not claims:
         return "✅ Aksiyon bekleyen iade bulunmuyor."
 
+    shown = claims[:30]
     lines = [f"📦 *Aksiyon Bekleyen İadeler* ({len(claims)} adet)\n"]
-    for claim in claims:
-        claim_id   = claim.get("id", "—")
-        order_no   = claim.get("orderNumber", "—")
-        items      = claim.get("claimItems", claim.get("items", []))
-        reason     = ""
-        product    = ""
+
+    for claim in shown:
+        order_no  = claim.get("orderNumber", "—")
+        items     = claim.get("claimItems", claim.get("items", []))
+        reason    = "—"
+        product   = "—"
+        order_date = ""
+        claim_date = ""
+
         if items:
             first   = items[0]
             reason  = first.get("customerClaimReason", first.get("claimReason", "—"))
             product = first.get("productName", first.get("productSize", "—"))
 
+        # Sipariş tarihi
+        od = claim.get("orderDate", claim.get("createdDate", 0))
+        if od:
+            try:
+                order_date = datetime.fromtimestamp(od / 1000).strftime("%d.%m.%y")
+            except Exception:
+                pass
+
+        # İade tarihi
+        cd = claim.get("claimDate", claim.get("lastModifiedDate", 0))
+        if cd:
+            try:
+                claim_date = datetime.fromtimestamp(cd / 1000).strftime("%d.%m.%y")
+            except Exception:
+                pass
+
         lines.append(
-            f"🔸 Sipariş: #{order_no}\n"
-            f"   Ürün: {str(product)[:45]}\n"
-            f"   Sebep: {reason}\n"
-            f"   ID: `{claim_id}`"
+            f"🔸 #{order_no}\n"
+            f"   Sebep: {str(reason)[:45]}\n"
+            f"   SP: {order_date} | İT: {claim_date}"
         )
+
+    if len(claims) > 30:
+        lines.append(f"\n_...ve {len(claims) - 30} iade daha_")
 
     lines.append("\n💡 Tümünü onaylamak için: *iadeleri onayla*")
     return "\n".join(lines)
