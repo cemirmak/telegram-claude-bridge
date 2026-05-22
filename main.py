@@ -609,19 +609,31 @@ async def fetch_pending_claims() -> list:
             return []
         data    = r.json()
         content = data.get("content", [])
-        if content:
-            log.info(f"İlk iade TAM JSON: {json.dumps(content[0], ensure_ascii=False)}")
-        log.info(f"Toplam iade: {len(content)}")
-        return content
+
+        # API filtresi çalışmıyor — claimItemStatus kontrolü ile filtrele
+        waiting = []
+        for claim in content:
+            has_waiting = False
+            for item_group in claim.get("items", []):
+                for ci in item_group.get("claimItems", []):
+                    status = ci.get("claimItemStatus", {}).get("name", "")
+                    if status == "WaitingInAction":
+                        has_waiting = True
+                        break
+            if has_waiting:
+                waiting.append(claim)
+
+        log.info(f"Toplam iade: {len(content)} | WaitingInAction: {len(waiting)}")
+        return waiting
     except Exception as e:
         log.error(f"İade fetch hatası: {e}")
         return []
 
 
 async def approve_claim(claim_id: str, line_item_ids: list) -> bool:
-    """Belirli bir iadeyi onaylar."""
+    """Belirli bir iadeyi onaylar — claimLineItemIdList kullanır."""
     url = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/claims/{claim_id}/items/approve"
-    body = {"claimLineItemIdList": line_item_ids}
+    body = {"claimLineItemIdList": line_item_ids, "params": {}}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.put(url, headers=get_trendyol_headers(), json=body)
@@ -991,9 +1003,15 @@ async def check_new_claims():
         success = 0
         fail    = 0
         for claim in claims:
-            claim_id = str(claim.get("id", ""))
-            items    = claim.get("claimItems", claim.get("items", []))
-            line_ids = [item.get("id") for item in items if item.get("id")]
+            claim_id = str(claim.get("id") or claim.get("claimId", ""))
+            # claimLineItemIdList: items[].claimItems[].id
+            line_ids = []
+            for item_group in claim.get("items", []):
+                for ci in item_group.get("claimItems", []):
+                    if ci.get("claimItemStatus", {}).get("name") == "WaitingInAction":
+                        cid = ci.get("id")
+                        if cid:
+                            line_ids.append(cid)
             if claim_id and line_ids:
                 ok = await approve_claim(claim_id, line_ids)
                 if ok:
@@ -1591,9 +1609,14 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
             success = 0
             fail    = 0
             for claim in claims:
-                claim_id = str(claim.get("id", ""))
-                items    = claim.get("claimItems", claim.get("items", []))
-                line_ids = [item.get("id") for item in items if item.get("id")]
+                claim_id = str(claim.get("id") or claim.get("claimId", ""))
+                line_ids = []
+                for item_group in claim.get("items", []):
+                    for ci in item_group.get("claimItems", []):
+                        if ci.get("claimItemStatus", {}).get("name") == "WaitingInAction":
+                            cid = ci.get("id")
+                            if cid:
+                                line_ids.append(cid)
                 if claim_id and line_ids:
                     ok = await approve_claim(claim_id, line_ids)
                     if ok:
