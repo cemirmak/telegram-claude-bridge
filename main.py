@@ -215,6 +215,145 @@ def is_excel_request(text: str) -> bool:
     keywords = ["excel", "xlsx", "dosya", "indir", "tablo"]
     return any(kw in text.lower() for kw in keywords) and is_order_report_request(text)
 
+
+# ─── Sosyal Medya İstatistikleri ─────────────────────────────────────────────
+
+async def get_instagram_insights(period: str = "day") -> dict:
+    """Instagram hesap istatistiklerini çeker."""
+    metrics = "follower_count,impressions,reach,profile_views"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            # Hesap bilgileri
+            r = await client.get(
+                f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}",
+                params={
+                    "fields": "followers_count,media_count,name",
+                    "access_token": META_ACCESS_TOKEN,
+                },
+            )
+            account = r.json()
+
+            # Insights
+            r = await client.get(
+                f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/insights",
+                params={
+                    "metric": metrics,
+                    "period": period,
+                    "access_token": META_ACCESS_TOKEN,
+                },
+            )
+            insights_data = r.json().get("data", [])
+
+        result = {
+            "followers":      account.get("followers_count", "—"),
+            "media_count":    account.get("media_count", "—"),
+            "impressions":    0,
+            "reach":          0,
+            "profile_views":  0,
+            "follower_count": 0,
+        }
+        for item in insights_data:
+            name  = item.get("name", "")
+            value = item.get("values", [{}])[-1].get("value", 0) if item.get("values") else 0
+            if name in result:
+                result[name] = value
+
+        return result
+    except Exception as e:
+        log.error(f"Instagram insights hatası: {e}")
+        return {}
+
+
+async def get_facebook_insights(period: str = "day") -> dict:
+    """Facebook sayfa istatistiklerini çeker."""
+    metrics = "page_impressions,page_reach,page_fans,page_post_engagements,page_views_total"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            # Sayfa bilgileri
+            r = await client.get(
+                f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}",
+                params={
+                    "fields": "fan_count,followers_count,name",
+                    "access_token": FACEBOOK_ACCESS_TOKEN,
+                },
+            )
+            page = r.json()
+
+            # Insights
+            r = await client.get(
+                f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/insights",
+                params={
+                    "metric": metrics,
+                    "period": period,
+                    "access_token": FACEBOOK_ACCESS_TOKEN,
+                },
+            )
+            insights_data = r.json().get("data", [])
+
+        result = {
+            "fan_count":             page.get("fan_count", "—"),
+            "followers_count":       page.get("followers_count", "—"),
+            "page_impressions":      0,
+            "page_reach":            0,
+            "page_post_engagements": 0,
+            "page_views_total":      0,
+        }
+        for item in insights_data:
+            name  = item.get("name", "")
+            vals  = item.get("values", [])
+            value = vals[-1].get("value", 0) if vals else 0
+            if name in result:
+                result[name] = value
+
+        return result
+    except Exception as e:
+        log.error(f"Facebook insights hatası: {e}")
+        return {}
+
+
+async def get_combined_insights(period: str = "day") -> str:
+    """Instagram + Facebook istatistiklerini tek mesajda döndürür."""
+    period_label = "Günlük" if period == "day" else "Haftalık"
+
+    ig, fb = await asyncio.gather(
+        get_instagram_insights(period),
+        get_facebook_insights(period),
+    )
+
+    if not ig and not fb:
+        return "❌ İstatistikler alınamadı. Token veya izin sorunu olabilir."
+
+    return f"""📊 *{period_label} Sosyal Medya İstatistikleri*
+_{datetime.now().strftime('%d.%m.%Y %H:%M')}_
+
+📸 *Instagram*
+• Takipçi: {ig.get('followers', '—')}
+• Toplam Gönderi: {ig.get('media_count', '—')}
+• Gösterim: {ig.get('impressions', '—')}
+• Erişim: {ig.get('reach', '—')}
+• Profil Ziyareti: {ig.get('profile_views', '—')}
+
+📘 *Facebook*
+• Takipçi: {fb.get('followers_count', '—')}
+• Beğeni: {fb.get('fan_count', '—')}
+• Gösterim: {fb.get('page_impressions', '—')}
+• Erişim: {fb.get('page_reach', '—')}
+• Etkileşim: {fb.get('page_post_engagements', '—')}
+• Sayfa Görüntüleme: {fb.get('page_views_total', '—')}
+
+_✅ Meta API verisi_"""
+
+
+def is_insights_request(text: str) -> bool:
+    keywords = ["istatistik", "etkileşim", "takipçi", "erişim", "gösterim", "analiz", "insight"]
+    return any(kw in text.lower() for kw in keywords)
+
+
+def get_insights_period(text: str) -> str:
+    if "hafta" in text.lower():
+        return "week"
+    return "day"
+
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
 async def get_or_create_session() -> str:
@@ -1079,6 +1218,13 @@ async def handle_order_report(chat_id: int, text: str) -> None:
 
 async def handle_message(chat_id: int, text: str) -> None:
     try:
+        if is_insights_request(text):
+            period = get_insights_period(text)
+            await send_telegram(chat_id, "⏳ İstatistikler çekiliyor...")
+            report = await get_combined_insights(period)
+            await send_telegram(chat_id, report)
+            return
+
         if is_new_products_request(text):
             await send_telegram(chat_id, get_new_products())
             return
