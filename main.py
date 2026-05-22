@@ -1103,16 +1103,17 @@ async def lifespan(app: FastAPI):
 
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=9,  minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=12, minute=0))
-    scheduler.add_job(scheduled_carousel, CronTrigger(hour=16, minute=0))
+    scheduler.add_job(scheduled_carousel, CronTrigger(hour=15, minute=0))
     scheduler.add_job(scheduled_carousel, CronTrigger(hour=21, minute=0))
     scheduler.add_job(scheduled_reels,    CronTrigger(hour=10, minute=30))
-    scheduler.add_job(scheduled_reels,    CronTrigger(hour=19, minute=0))
+    scheduler.add_job(scheduled_reels,    CronTrigger(hour=16, minute=0))
+    scheduler.add_job(scheduled_reels,    CronTrigger(hour=20, minute=0))
     scheduler.add_job(scheduled_story,    CronTrigger(hour=14, minute=0))
     scheduler.add_job(scheduled_story,    CronTrigger(hour=23, minute=0))
     scheduler.add_job(check_new_orders,   IntervalTrigger(minutes=5))
 
     scheduler.start()
-    log.info("⏰ Carousel 09:00/12:00/16:00/21:00 | Reels 10:30/19:00 | Story 14:00/23:00 | Sipariş her 5dk (TR)")
+    log.info("⏰ Carousel 09:00/12:00/15:00/21:00 | Reels 10:30/16:00/20:00 | Story 14:00/23:00 | Sipariş her 5dk (TR)")
 
     yield
     scheduler.shutdown()
