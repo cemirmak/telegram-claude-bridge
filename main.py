@@ -378,13 +378,32 @@ _✅ Meta API verisi_"""
 
 
 def is_pending_claims_request(text: str) -> bool:
-    keywords = ["bekleyen iade", "iade listesi", "iade talebi", "aksiyon bekleyen"]
+    text_lower = text.lower()
+    # "iade" kelimesi geçiyorsa ve liste/göster/talep gibi bir fiil varsa
+    if "iade" in text_lower:
+        triggers = ["listele", "göster", "var mı", "talebi", "talepleri", "bekleyen", "aksiyon", "liste"]
+        return any(t in text_lower for t in triggers)
+    return False
+
+
+def is_dashboard_request(text: str) -> bool:
+    keywords = ["bildirimler", "özet göster", "durum özeti", "genel durum", "neler var"]
     return any(kw in text.lower() for kw in keywords)
 
 
 def is_approve_claims_request(text: str) -> bool:
     keywords = ["iadeleri onayla", "iadeyi onayla", "iadeleri kabul", "toplu onayla"]
     return any(kw in text.lower() for kw in keywords)
+
+
+def is_pending_questions_request(text: str) -> bool:
+    text_lower = text.lower()
+    if "trendyol" not in text_lower:
+        return False
+    if "soru" in text_lower:
+        triggers = ["listele", "göster", "bekleyen", "var mı", "cevap bekleyen"]
+        return any(t in text_lower for t in triggers)
+    return False
 
 
 def is_insights_request(text: str) -> bool:
@@ -1469,10 +1488,50 @@ async def handle_message(chat_id: int, text: str) -> None:
             await send_telegram(chat_id, report)
             return
 
+        if is_dashboard_request(text):
+            await send_telegram(chat_id, "⏳ Bildirimler çekiliyor...")
+            # Yeni siparişler (son 30 dk)
+            new_orders    = await fetch_new_orders()
+            # Bekleyen iadeler
+            claims        = await fetch_pending_claims()
+            # Bekleyen sorular
+            questions     = await fetch_pending_questions()
+
+            msg = f"""📋 *Trendyol Genel Durum*
+_{datetime.now().strftime('%d.%m.%Y %H:%M')}_
+
+🛍 Yeni Sipariş (son 30 dk): {len(new_orders)} adet
+🔄 Bekleyen İade: {len(claims)} adet
+❓ Cevap Bekleyen Soru: {len(questions)} adet"""
+
+            if claims:
+                msg += "\n\n💡 İadeleri görmek için: *trendyol iadeleri göster*"
+            if questions:
+                msg += "\n💡 Soruları görmek için: *bekleyen sorular*"
+
+            await send_telegram(chat_id, msg)
+            return
+
         if is_pending_claims_request(text):
             await send_telegram(chat_id, "⏳ İadeler çekiliyor...")
             claims = await fetch_pending_claims()
             await send_telegram(chat_id, format_claims_message(claims))
+            return
+
+        if is_pending_questions_request(text):
+            await send_telegram(chat_id, "⏳ Sorular çekiliyor...")
+            questions = await fetch_pending_questions()
+            if not questions:
+                await send_telegram(chat_id, "✅ Cevap bekleyen soru bulunmuyor.")
+                return
+            lines = [f"❓ *Cevap Bekleyen Sorular* ({len(questions)} adet)\n"]
+            for q in questions[:10]:
+                q_id    = q.get("id", "—")
+                product = q.get("productName", q.get("product", {}).get("name", "—"))
+                q_text  = q.get("text", q.get("questionText", "—"))
+                lines.append(f"🔸 *{str(product)[:40]}*\n   {str(q_text)[:100]}\n   ID: `{q_id}`")
+            lines.append("\n💡 Cevap için: *cevap: ID: Cevabınız*")
+            await send_telegram(chat_id, "\n".join(lines))
             return
 
         if is_approve_claims_request(text):
@@ -1541,6 +1600,24 @@ async def lifespan(app: FastAPI):
     }
     ADMIN_CHAT_IDS.discard(0)
     log.info(f"Admin chat ID'leri: {ADMIN_CHAT_IDS}")
+
+    # Mevcut iadeleri ve soruları başlangıçta yükle — bildirim flood'unu önle
+    try:
+        existing_claims = await fetch_pending_claims()
+        for c in existing_claims:
+            cid = str(c.get("id", ""))
+            if cid:
+                _notified_claims.add(cid)
+        log.info(f"Mevcut {len(_notified_claims)} iade bildirim listesine eklendi")
+
+        existing_questions = await fetch_pending_questions()
+        for q in existing_questions:
+            qid = str(q.get("id", ""))
+            if qid:
+                _notified_questions.add(qid)
+        log.info(f"Mevcut {len(_notified_questions)} soru bildirim listesine eklendi")
+    except Exception as e:
+        log.error(f"Mevcut iade/soru yükleme hatası: {e}")
 
     try:
         sid = await get_or_create_session()
