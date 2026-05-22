@@ -218,45 +218,46 @@ def is_excel_request(text: str) -> bool:
 
 # ─── Sosyal Medya İstatistikleri ─────────────────────────────────────────────
 
-async def get_instagram_insights(period: str = "day") -> dict:
-    """Instagram hesap istatistiklerini çeker."""
-    metrics = "follower_count,impressions,reach,profile_views"
+async def get_instagram_insights(days: int = 1) -> dict:
+    """Instagram hesap istatistiklerini çeker — son N günün toplamı."""
+    since = int((datetime.now() - timedelta(days=days)).timestamp())
+    until = int(datetime.now().timestamp())
+    metrics = "impressions,reach,profile_views,follower_count"
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             # Hesap bilgileri
             r = await client.get(
                 f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}",
-                params={
-                    "fields": "followers_count,media_count,name",
-                    "access_token": META_ACCESS_TOKEN,
-                },
+                params={"fields": "followers_count,media_count", "access_token": META_ACCESS_TOKEN},
             )
             account = r.json()
 
-            # Insights
+            # Insights — günlük periyot, tarih aralığı ile
             r = await client.get(
                 f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/insights",
                 params={
-                    "metric": metrics,
-                    "period": period,
+                    "metric":  metrics,
+                    "period":  "day",
+                    "since":   since,
+                    "until":   until,
                     "access_token": META_ACCESS_TOKEN,
                 },
             )
             insights_data = r.json().get("data", [])
 
         result = {
-            "followers":      account.get("followers_count", "—"),
-            "media_count":    account.get("media_count", "—"),
-            "impressions":    0,
-            "reach":          0,
-            "profile_views":  0,
-            "follower_count": 0,
+            "followers":     account.get("followers_count", "—"),
+            "media_count":   account.get("media_count", "—"),
+            "impressions":   0,
+            "reach":         0,
+            "profile_views": 0,
         }
         for item in insights_data:
-            name  = item.get("name", "")
-            value = item.get("values", [{}])[-1].get("value", 0) if item.get("values") else 0
+            name = item.get("name", "")
             if name in result:
-                result[name] = value
+                # Tüm günlerin değerlerini topla
+                total = sum(v.get("value", 0) for v in item.get("values", []))
+                result[name] = total
 
         return result
     except Exception as e:
@@ -264,18 +265,17 @@ async def get_instagram_insights(period: str = "day") -> dict:
         return {}
 
 
-async def get_facebook_insights(period: str = "day") -> dict:
-    """Facebook sayfa istatistiklerini çeker."""
-    metrics = "page_impressions,page_reach,page_fans,page_post_engagements,page_views_total"
+async def get_facebook_insights(days: int = 1) -> dict:
+    """Facebook sayfa istatistiklerini çeker — son N günün toplamı."""
+    since = int((datetime.now() - timedelta(days=days)).timestamp())
+    until = int(datetime.now().timestamp())
+    metrics = "page_impressions,page_reach,page_post_engagements,page_views_total"
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             # Sayfa bilgileri
             r = await client.get(
                 f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}",
-                params={
-                    "fields": "fan_count,followers_count,name",
-                    "access_token": FACEBOOK_ACCESS_TOKEN,
-                },
+                params={"fields": "fan_count,followers_count", "access_token": FACEBOOK_ACCESS_TOKEN},
             )
             page = r.json()
 
@@ -283,8 +283,10 @@ async def get_facebook_insights(period: str = "day") -> dict:
             r = await client.get(
                 f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/insights",
                 params={
-                    "metric": metrics,
-                    "period": period,
+                    "metric":  metrics,
+                    "period":  "day",
+                    "since":   since,
+                    "until":   until,
                     "access_token": FACEBOOK_ACCESS_TOKEN,
                 },
             )
@@ -299,11 +301,10 @@ async def get_facebook_insights(period: str = "day") -> dict:
             "page_views_total":      0,
         }
         for item in insights_data:
-            name  = item.get("name", "")
-            vals  = item.get("values", [])
-            value = vals[-1].get("value", 0) if vals else 0
+            name = item.get("name", "")
             if name in result:
-                result[name] = value
+                total = sum(v.get("value", 0) for v in item.get("values", []))
+                result[name] = total
 
         return result
     except Exception as e:
@@ -311,35 +312,42 @@ async def get_facebook_insights(period: str = "day") -> dict:
         return {}
 
 
-async def get_combined_insights(period: str = "day") -> str:
+async def get_combined_insights(days: int = 1) -> str:
     """Instagram + Facebook istatistiklerini tek mesajda döndürür."""
-    period_label = "Günlük" if period == "day" else "Haftalık"
+    if days == 1:
+        label = "Günlük"
+    elif days == 7:
+        label = "Haftalık"
+    elif days == 30:
+        label = "Aylık"
+    else:
+        label = f"Son {days} Günlük"
 
     ig, fb = await asyncio.gather(
-        get_instagram_insights(period),
-        get_facebook_insights(period),
+        get_instagram_insights(days),
+        get_facebook_insights(days),
     )
 
     if not ig and not fb:
         return "❌ İstatistikler alınamadı. Token veya izin sorunu olabilir."
 
-    return f"""📊 *{period_label} Sosyal Medya İstatistikleri*
+    return f"""📊 *{label} Sosyal Medya İstatistikleri*
 _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 
 📸 *Instagram*
 • Takipçi: {ig.get('followers', '—')}
 • Toplam Gönderi: {ig.get('media_count', '—')}
-• Gösterim: {ig.get('impressions', '—')}
-• Erişim: {ig.get('reach', '—')}
-• Profil Ziyareti: {ig.get('profile_views', '—')}
+• Gösterim: {ig.get('impressions', 0):,}
+• Erişim: {ig.get('reach', 0):,}
+• Profil Ziyareti: {ig.get('profile_views', 0):,}
 
 📘 *Facebook*
 • Takipçi: {fb.get('followers_count', '—')}
 • Beğeni: {fb.get('fan_count', '—')}
-• Gösterim: {fb.get('page_impressions', '—')}
-• Erişim: {fb.get('page_reach', '—')}
-• Etkileşim: {fb.get('page_post_engagements', '—')}
-• Sayfa Görüntüleme: {fb.get('page_views_total', '—')}
+• Gösterim: {fb.get('page_impressions', 0):,}
+• Erişim: {fb.get('page_reach', 0):,}
+• Etkileşim: {fb.get('page_post_engagements', 0):,}
+• Sayfa Görüntüleme: {fb.get('page_views_total', 0):,}
 
 _✅ Meta API verisi_"""
 
@@ -349,10 +357,16 @@ def is_insights_request(text: str) -> bool:
     return any(kw in text.lower() for kw in keywords)
 
 
-def get_insights_period(text: str) -> str:
-    if "hafta" in text.lower():
-        return "week"
-    return "day"
+def get_insights_days(text: str) -> int:
+    text = text.lower()
+    if "bu ay" in text or "aylık" in text or "30 gün" in text:
+        return 30
+    if "bu hafta" in text or "haftalık" in text or "7 gün" in text:
+        return 7
+    match = re.search(r"(\d+)\s*gün", text)
+    if match:
+        return min(int(match.group(1)), 30)
+    return 1
 
 # ─── Session yönetimi ───────────────────────────────────────────────────────
 
@@ -1219,9 +1233,9 @@ async def handle_order_report(chat_id: int, text: str) -> None:
 async def handle_message(chat_id: int, text: str) -> None:
     try:
         if is_insights_request(text):
-            period = get_insights_period(text)
+            days = get_insights_days(text)
             await send_telegram(chat_id, "⏳ İstatistikler çekiliyor...")
-            report = await get_combined_insights(period)
+            report = await get_combined_insights(days)
             await send_telegram(chat_id, report)
             return
 
