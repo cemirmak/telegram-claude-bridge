@@ -972,7 +972,13 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
             params={"creation_id": carousel["id"], "access_token": META_ACCESS_TOKEN},
         )
-        return r.json()
+        result = r.json()
+        if r.status_code not in (200, 201):
+            log.error(f"Carousel publish hatası: {r.status_code} {r.text}")
+        # 403 gelse bile yayınlanmış olabiliyor
+        if "id" in result or r.status_code in (200, 201):
+            return {"id": result.get("id", "ok")}
+        return result
 
 
 async def instagram_reels_post(video_url: str, caption: str) -> dict:
