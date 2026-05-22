@@ -75,6 +75,7 @@ _active_session_id: str   = SESSION_ID
 _posted_today: set         = set()
 _posted_date: str          = ""
 _notified_orders: set      = set()
+_notified_claims: set      = set()
 SUPPLIER_DATA: list        = []
 BARCODE_SUPPLIER_MAP: dict = {}
 BARCODE_IMAGE_MAP: dict    = {}
@@ -899,6 +900,50 @@ Lütfen hazırlayınız ✅"""
         if len(_notified_orders) > 1000:
             _notified_orders = set(list(_notified_orders)[-500:])
 
+async def check_new_claims():
+    """Her 5 dakikada yeni WaitingInAction iadeleri kontrol eder."""
+    global _notified_claims
+
+    if not TRENDYOL_API_KEY or not TRENDYOL_API_SECRET:
+        return
+
+    claims = await fetch_pending_claims()
+    if not claims:
+        return
+
+    for claim in claims:
+        claim_id = str(claim.get("id", ""))
+        if not claim_id or claim_id in _notified_claims:
+            continue
+
+        order_no = claim.get("orderNumber", "—")
+        items    = claim.get("claimItems", claim.get("items", []))
+        product  = ""
+        reason   = ""
+        amount   = 0.0
+        if items:
+            first   = items[0]
+            product = first.get("productName", first.get("productSize", "—"))
+            reason  = first.get("customerClaimReason", first.get("claimReason", "—"))
+            amount  = first.get("price", first.get("amount", 0))
+
+        msg = f"""🔄 *Yeni İade Talebi!*
+
+🏪 Sipariş No: #{order_no}
+📦 Ürün: {str(product)[:55]}
+📝 Sebep: {reason}
+💰 Tutar: {float(amount):.2f}₺
+
+⚡ Onaylamak için: *iadeleri onayla*"""
+
+        await notify_telegram(msg)
+        _notified_claims.add(claim_id)
+        log.info(f"İade bildirimi gönderildi: {claim_id}")
+
+        if len(_notified_claims) > 500:
+            _notified_claims = set(list(_notified_claims)[-250:])
+
+
 # ─── ImgBB ──────────────────────────────────────────────────────────────────
 
 async def upload_to_imgbb(image_url: str) -> str:
@@ -1421,9 +1466,10 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(scheduled_story,    CronTrigger(hour=14, minute=0))
     scheduler.add_job(scheduled_story,    CronTrigger(hour=23, minute=0))
     scheduler.add_job(check_new_orders,   IntervalTrigger(minutes=5))
+    scheduler.add_job(check_new_claims,    IntervalTrigger(minutes=5))
 
     scheduler.start()
-    log.info("⏰ Carousel 09:00/12:00/15:00/21:00 | Reels 10:30/16:00/20:00 | Story 14:00/23:00 | Sipariş her 5dk (TR)")
+    log.info("⏰ Carousel 09:00/12:00/15:00/21:00 | Reels 10:30/16:00/20:00 | Story 14:00/23:00 | Sipariş+İade her 5dk (TR)")
 
     yield
     scheduler.shutdown()
