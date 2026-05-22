@@ -78,7 +78,6 @@ _active_session_id: str   = SESSION_ID
 _posted_today: set         = set()
 _posted_date: str          = ""
 _notified_orders: set      = set()
-_notified_claims: set      = set()
 _notified_questions: set   = set()
 SUPPLIER_DATA: list        = []
 BARCODE_SUPPLIER_MAP: dict = {}
@@ -254,20 +253,29 @@ async def get_instagram_insights(days: int = 1) -> dict:
             total_comments    = 0
 
             for media in media_list:
-                media_id = media.get("id")
+                media_id   = media.get("id")
+                media_type = media.get("media_type", "")
                 if not media_id:
                     continue
+                # Reels için farklı metrikler kullan
+                if media_type == "VIDEO":
+                    metrics = "plays,reach,likes,comments,shares"
+                else:
+                    metrics = "impressions,reach,likes,comments"
                 r2 = await client.get(
                     f"{GRAPH_BASE}/{media_id}/insights",
-                    params={
-                        "metric": "impressions,reach,likes,comments",
-                        "access_token": META_ACCESS_TOKEN,
-                    },
+                    params={"metric": metrics, "access_token": META_ACCESS_TOKEN},
                 )
+                if r2.status_code != 200:
+                    # Fallback: temel metrikler dene
+                    r2 = await client.get(
+                        f"{GRAPH_BASE}/{media_id}/insights",
+                        params={"metric": "impressions,reach", "access_token": META_ACCESS_TOKEN},
+                    )
                 for item in r2.json().get("data", []):
                     name  = item.get("name", "")
                     value = item.get("values", [{}])[0].get("value", 0) if item.get("values") else item.get("value", 0)
-                    if name == "impressions":
+                    if name in ("impressions", "plays"):
                         total_impressions += value
                     elif name == "reach":
                         total_reach += value
@@ -377,24 +385,9 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 _✅ Meta API verisi_"""
 
 
-def is_pending_claims_request(text: str) -> bool:
-    text_lower = text.lower()
-    # "iade" kelimesi geçiyorsa ve liste/göster/talep gibi bir fiil varsa
-    if "iade" in text_lower:
-        triggers = ["listele", "göster", "var mı", "talebi", "talepleri", "bekleyen", "aksiyon", "liste"]
-        return any(t in text_lower for t in triggers)
-    return False
-
-
 def is_dashboard_request(text: str) -> bool:
     keywords = ["bildirimler", "özet göster", "durum özeti", "genel durum", "neler var"]
     return any(kw in text.lower() for kw in keywords)
-
-
-def is_approve_claims_request(text: str) -> bool:
-    keywords = ["iadeleri onayla", "iadeyi onayla", "iadeleri kabul", "toplu onayla", "iadeleri onayla"]
-    text_lower = text.lower().strip()
-    return any(kw in text_lower for kw in keywords)
 
 
 def is_pending_questions_request(text: str) -> bool:
@@ -596,120 +589,6 @@ async def fetch_new_orders() -> list:
 
 
 # ─── Trendyol İade İşlemleri ─────────────────────────────────────────────────
-
-async def fetch_pending_claims() -> list:
-    """Son 30 günün aksiyon bekleyen iadeleri çeker — tüm sayfalara bakar."""
-    url      = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/claims"
-    since_ms = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
-    all_claims = []
-    page = 0
-
-    while page < 10:  # max 10 sayfa
-        params = {"status": "WaitingInAction", "size": 50, "page": page}
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                r = await client.get(url, headers=get_trendyol_headers(), params=params)
-            if r.status_code != 200:
-                log.warning(f"İade listesi hatası: {r.status_code} {r.text[:200]}")
-                break
-            data        = r.json()
-            content     = data.get("content", [])
-            total_pages = data.get("totalPages", 1)
-            all_claims.extend(content)
-            if page >= total_pages - 1 or not content:
-                break
-            page += 1
-        except Exception as e:
-            log.error(f"İade fetch hatası: {e}")
-            break
-
-    # resolved=false olan aksiyon bekleyenleri filtrele
-    waiting = []
-    for claim in all_claims:
-        # Son 30 günün iadelerini al
-        claim_date = claim.get("claimDate", 0)
-        if claim_date and claim_date < since_ms:
-            continue
-        has_action = False
-        for item_group in claim.get("items", []):
-            for ci in item_group.get("claimItems", []):
-                if not ci.get("resolved", True) and not ci.get("acceptedBySeller", True):
-                    has_action = True
-                    break
-        if has_action:
-            waiting.append(claim)
-
-    log.info(f"Toplam iade: {len(all_claims)} | Aksiyon bekleyen: {len(waiting)}")
-    return waiting
-
-
-async def approve_claim(claim_id: str, line_item_ids: list) -> bool:
-    """Belirli bir iadeyi onaylar — claimLineItemIdList kullanır."""
-    url = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/claims/{claim_id}/items/approve"
-    body = {"claimLineItemIdList": line_item_ids, "params": {}}
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.put(url, headers=get_trendyol_headers(), json=body)
-        if r.status_code in (200, 201, 204):
-            log.info(f"İade onaylandı: {claim_id}")
-            return True
-        log.error(f"İade onaylama hatası: {r.status_code} {r.text}")
-        return False
-    except Exception as e:
-        log.error(f"İade onaylama exception: {e}")
-        return False
-
-
-def format_claims_message(claims: list) -> str:
-    """İade listesini Telegram mesajına çevirir — son 30 iade."""
-    if not claims:
-        return "✅ Aksiyon bekleyen iade bulunmuyor."
-
-    shown = claims[:30]
-    lines = [f"📦 *Aksiyon Bekleyen İadeler* ({len(claims)} adet)\n"]
-
-    for claim in shown:
-        order_no  = claim.get("orderNumber", "—")
-        items     = claim.get("claimItems", claim.get("items", []))
-        reason    = "—"
-        product   = "—"
-        order_date = ""
-        claim_date = ""
-
-        if items:
-            first   = items[0]
-            reason  = first.get("customerClaimReason", first.get("claimReason", "—"))
-            product = first.get("productName", first.get("productSize", "—"))
-
-        # Sipariş tarihi
-        od = claim.get("orderDate", claim.get("createdDate", 0))
-        if od:
-            try:
-                order_date = datetime.fromtimestamp(od / 1000).strftime("%d.%m.%y")
-            except Exception:
-                pass
-
-        # İade tarihi
-        cd = claim.get("claimDate", claim.get("lastModifiedDate", 0))
-        if cd:
-            try:
-                claim_date = datetime.fromtimestamp(cd / 1000).strftime("%d.%m.%y")
-            except Exception:
-                pass
-
-        lines.append(
-            f"🔸 #{order_no}\n"
-            f"   Sebep: {str(reason)[:45]}\n"
-            f"   SP: {order_date} | İT: {claim_date}"
-        )
-
-    if len(claims) > 30:
-        lines.append(f"\n_...ve {len(claims) - 30} iade daha_")
-
-    lines.append("\n💡 Tümünü onaylamak için: *iadeleri onayla*")
-    return "\n".join(lines)
-
-# ─── Kâr hesabı ─────────────────────────────────────────────────────────────
 
 def calculate_profit(total_amount: float, total_orders: int, total_qty: int) -> dict:
     komisyon    = total_amount * 0.215
@@ -969,79 +848,6 @@ Lütfen hazırlayınız ✅"""
         _notified_orders.add(order_id)
         if len(_notified_orders) > 1000:
             _notified_orders = set(list(_notified_orders)[-500:])
-
-async def check_new_claims():
-    """Her 5 dakikada yeni WaitingInAction iadeleri kontrol eder. 5+ iade varsa otomatik onaylar."""
-    global _notified_claims
-
-    if not TRENDYOL_API_KEY or not TRENDYOL_API_SECRET:
-        return
-
-    claims = await fetch_pending_claims()
-    if not claims:
-        return
-
-    # Yeni iadeleri bildir
-    for claim in claims:
-        claim_id = str(claim.get("id", ""))
-        if not claim_id or claim_id in _notified_claims:
-            continue
-
-        order_no = claim.get("orderNumber", "—")
-        items    = claim.get("claimItems", claim.get("items", []))
-        reason   = "—"
-        amount   = 0.0
-        if items:
-            first  = items[0]
-            reason = first.get("customerClaimReason", first.get("claimReason", "—"))
-            amount = first.get("price", first.get("amount", 0))
-
-        msg = (
-            f"🔄 *Yeni İade Talebi!*\n\n"
-            f"🏪 Sipariş No: #{order_no}\n"
-            f"📝 Sebep: {reason}\n"
-            f"💰 Tutar: {float(amount):.2f}₺\n\n"
-            f"⚡ Onaylamak için: *iadeleri onayla*"
-        )
-        await notify_telegram(msg)
-        _notified_claims.add(claim_id)
-        log.info(f"İade bildirimi gönderildi: {claim_id}")
-
-    if len(_notified_claims) > 500:
-        _notified_claims = set(list(_notified_claims)[-250:])
-
-    # 5 veya daha fazla bekleyen iade varsa otomatik onayla
-    if len(claims) >= 5:
-        log.info(f"Otomatik onay: {len(claims)} bekleyen iade")
-        success = 0
-        fail    = 0
-        for claim in claims:
-            claim_id = str(claim.get("id") or claim.get("claimId", ""))
-            line_ids = []
-            for item_group in claim.get("items", []):
-                for ci in item_group.get("claimItems", []):
-                    if not ci.get("resolved", True) and not ci.get("acceptedBySeller", True):
-                        cid = ci.get("id")
-                        if cid:
-                            line_ids.append(cid)
-            if claim_id and line_ids:
-                ok = await approve_claim(claim_id, line_ids)
-                if ok:
-                    success += 1
-                else:
-                    fail += 1
-
-        await notify_telegram(
-            f"✅ *Otomatik İade Onayı*\n\n"
-            f"• Toplam: {len(claims)}\n"
-            f"• Onaylanan: {success}\n"
-            f"• Hatalı: {fail}"
-        )
-
-
-
-
-# ─── Trendyol Müşteri Soruları ───────────────────────────────────────────────
 
 async def fetch_pending_questions() -> list:
     """Cevap bekleyen müşteri sorularını çeker."""
@@ -1570,8 +1376,7 @@ async def handle_message(chat_id: int, text: str) -> None:
             await send_telegram(chat_id, "⏳ Bildirimler çekiliyor...")
             # Yeni siparişler (son 30 dk)
             new_orders    = await fetch_new_orders()
-            # Bekleyen iadeler
-            claims        = await fetch_pending_claims()
+            claims = []
             # Bekleyen sorular
             questions     = await fetch_pending_questions()
 
@@ -1579,7 +1384,6 @@ async def handle_message(chat_id: int, text: str) -> None:
 _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 
 🛍 Yeni Sipariş (son 30 dk): {len(new_orders)} adet
-🔄 Bekleyen İade: {len(claims)} adet
 ❓ Cevap Bekleyen Soru: {len(questions)} adet"""
 
             if claims:
@@ -1684,15 +1488,8 @@ async def lifespan(app: FastAPI):
     ADMIN_CHAT_IDS.discard(0)
     log.info(f"Admin chat ID'leri: {ADMIN_CHAT_IDS}")
 
-    # Mevcut iadeleri ve soruları başlangıçta yükle — bildirim flood'unu önle
+    # Mevcut soruları başlangıçta yükle — bildirim flood'unu önle
     try:
-        existing_claims = await fetch_pending_claims()
-        for c in existing_claims:
-            cid = str(c.get("id", ""))
-            if cid:
-                _notified_claims.add(cid)
-        log.info(f"Mevcut {len(_notified_claims)} iade bildirim listesine eklendi")
-
         existing_questions = await fetch_pending_questions()
         for q in existing_questions:
             qid = str(q.get("id", ""))
@@ -1718,11 +1515,10 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(scheduled_story,    CronTrigger(hour=14, minute=0))
     scheduler.add_job(scheduled_story,    CronTrigger(hour=23, minute=0))
     scheduler.add_job(check_new_orders,   IntervalTrigger(minutes=5))
-    scheduler.add_job(check_new_claims,    IntervalTrigger(minutes=5))
     scheduler.add_job(check_new_questions,  IntervalTrigger(minutes=5))
 
     scheduler.start()
-    log.info("⏰ Carousel 09:00/12:00/15:00/21:00 | Reels 10:30/16:00/20:00 | Story 14:00/23:00 | Sipariş+İade+Soru her 5dk (TR)")
+    log.info("⏰ Carousel 09:00/12:00/15:00/21:00 | Reels 10:30/16:00/20:00 | Story 14:00/23:00 | Sipariş+Soru her 5dk (TR)")
 
     yield
     scheduler.shutdown()
