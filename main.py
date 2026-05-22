@@ -474,7 +474,7 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 • Toplam Satış: {total_amount:.2f}₺
 • Komisyon (%21.5): -{profit['komisyon']:.2f}₺
 • Kargo ({total_orders} × 60₺): -{profit['kargo']:.2f}₺
-• İade/İptal: {returned + cancelled} adet
+• Maliyet - İade/İptal: {returned + cancelled} adet
 • Kazanç: {profit['kazanc']:.2f}₺
 {supplier_section}
 🏆 *En Çok Satan 5 Ürün*
