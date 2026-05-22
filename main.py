@@ -50,6 +50,9 @@ SUPPLIER_CHAT_IDS = {
 
 RESTRICTED_SUPPLIERS = {"Özer Denim"}
 
+# Tam yetkili kullanıcılar — tüm komutlara erişebilir
+ADMIN_CHAT_IDS: set = set()  # lifespan'da doldurulur
+
 CLAUDE_BASE   = "https://api.anthropic.com"
 TELEGRAM_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GRAPH_BASE    = "https://graph.facebook.com/v19.0"
@@ -1538,6 +1541,16 @@ scheduler = AsyncIOScheduler(timezone="Europe/Istanbul")
 async def lifespan(app: FastAPI):
     load_supplier_data()
 
+    # Admin chat ID'leri doldur
+    global ADMIN_CHAT_IDS
+    ADMIN_CHAT_IDS = {
+        int(os.environ.get("TELEGRAM_CHAT_ID", "0")),
+        int(os.environ.get("CEM_IRMAK_CHAT_ID", "6275247970")),
+        int(os.environ.get("VOLKAN_CHAT_ID", "7031711634")),
+    }
+    ADMIN_CHAT_IDS.discard(0)
+    log.info(f"Admin chat ID'leri: {ADMIN_CHAT_IDS}")
+
     try:
         sid = await get_or_create_session()
         log.info(f"✅ Hazır. Aktif session: {sid}")
@@ -1587,23 +1600,27 @@ async def webhook(request: Request, background: BackgroundTasks):
         return JSONResponse({"ok": True})
 
     if text.startswith("/post_now"):
-        background.add_task(scheduled_carousel)
-        await send_telegram(chat_id, "📸 Carousel paylaşımı başlatıldı...")
+        if chat_id in ADMIN_CHAT_IDS:
+            background.add_task(scheduled_carousel)
+            await send_telegram(chat_id, "📸 Carousel paylaşımı başlatıldı...")
         return JSONResponse({"ok": True})
 
     if text.startswith("/reels_now"):
-        background.add_task(scheduled_reels)
-        await send_telegram(chat_id, "🎬 Reels paylaşımı başlatıldı...")
+        if chat_id in ADMIN_CHAT_IDS:
+            background.add_task(scheduled_reels)
+            await send_telegram(chat_id, "🎬 Reels paylaşımı başlatıldı...")
         return JSONResponse({"ok": True})
 
     if text.startswith("/story_now"):
-        background.add_task(scheduled_story)
-        await send_telegram(chat_id, "📖 Story paylaşımı başlatıldı...")
+        if chat_id in ADMIN_CHAT_IDS:
+            background.add_task(scheduled_story)
+            await send_telegram(chat_id, "📖 Story paylaşımı başlatıldı...")
         return JSONResponse({"ok": True})
 
     if text.startswith("/check_orders"):
-        background.add_task(check_new_orders)
-        await send_telegram(chat_id, "🔍 Sipariş kontrolü başlatıldı...")
+        if chat_id in ADMIN_CHAT_IDS:
+            background.add_task(check_new_orders)
+            await send_telegram(chat_id, "🔍 Sipariş kontrolü başlatıldı...")
         return JSONResponse({"ok": True})
 
     background.add_task(handle_message, chat_id, text)
