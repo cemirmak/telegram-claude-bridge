@@ -610,20 +610,26 @@ async def fetch_pending_claims() -> list:
         data    = r.json()
         content = data.get("content", [])
 
-        # API filtresi çalışmıyor — claimItemStatus kontrolü ile filtrele
+        # Her iadeyi logla — statüsünü görmek için
         waiting = []
         for claim in content:
-            has_waiting = False
+            statuses = []
             for item_group in claim.get("items", []):
                 for ci in item_group.get("claimItems", []):
                     status = ci.get("claimItemStatus", {}).get("name", "")
-                    if status == "WaitingInAction":
-                        has_waiting = True
+                    statuses.append(status)
+            log.info(f"İade #{claim.get('orderNumber')} statüler: {statuses}")
+            # resolved=false ve acceptedBySeller=false olanları al
+            has_action = False
+            for item_group in claim.get("items", []):
+                for ci in item_group.get("claimItems", []):
+                    if not ci.get("resolved", True) and not ci.get("acceptedBySeller", True):
+                        has_action = True
                         break
-            if has_waiting:
+            if has_action:
                 waiting.append(claim)
 
-        log.info(f"Toplam iade: {len(content)} | WaitingInAction: {len(waiting)}")
+        log.info(f"Toplam iade: {len(content)} | Aksiyon bekleyen: {len(waiting)}")
         return waiting
     except Exception as e:
         log.error(f"İade fetch hatası: {e}")
@@ -1004,11 +1010,10 @@ async def check_new_claims():
         fail    = 0
         for claim in claims:
             claim_id = str(claim.get("id") or claim.get("claimId", ""))
-            # claimLineItemIdList: items[].claimItems[].id
             line_ids = []
             for item_group in claim.get("items", []):
                 for ci in item_group.get("claimItems", []):
-                    if ci.get("claimItemStatus", {}).get("name") == "WaitingInAction":
+                    if not ci.get("resolved", True) and not ci.get("acceptedBySeller", True):
                         cid = ci.get("id")
                         if cid:
                             line_ids.append(cid)
@@ -1613,7 +1618,7 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
                 line_ids = []
                 for item_group in claim.get("items", []):
                     for ci in item_group.get("claimItems", []):
-                        if ci.get("claimItemStatus", {}).get("name") == "WaitingInAction":
+                        if not ci.get("resolved", True) and not ci.get("acceptedBySeller", True):
                             cid = ci.get("id")
                             if cid:
                                 line_ids.append(cid)
