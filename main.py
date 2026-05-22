@@ -598,42 +598,49 @@ async def fetch_new_orders() -> list:
 # ─── Trendyol İade İşlemleri ─────────────────────────────────────────────────
 
 async def fetch_pending_claims() -> list:
-    """WaitingInAction statüsündeki iadeleri çeker."""
-    url = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/claims"
-    params = {"status": "WaitingInAction", "size": 50, "page": 0}
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(url, headers=get_trendyol_headers(), params=params)
-        if r.status_code != 200:
-            log.warning(f"İade listesi hatası: {r.status_code} {r.text[:200]}")
-            return []
-        data    = r.json()
-        content = data.get("content", [])
+    """Son 30 günün aksiyon bekleyen iadeleri çeker — tüm sayfalara bakar."""
+    url      = f"{TRENDYOL_BASE}/order/sellers/{TRENDYOL_SUPPLIER_ID}/claims"
+    since_ms = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
+    all_claims = []
+    page = 0
 
-        # Her iadeyi logla — statüsünü görmek için
-        waiting = []
-        for claim in content:
-            statuses = []
-            for item_group in claim.get("items", []):
-                for ci in item_group.get("claimItems", []):
-                    status = ci.get("claimItemStatus", {}).get("name", "")
-                    statuses.append(status)
-            log.info(f"İade #{claim.get('orderNumber')} statüler: {statuses}")
-            # resolved=false ve acceptedBySeller=false olanları al
-            has_action = False
-            for item_group in claim.get("items", []):
-                for ci in item_group.get("claimItems", []):
-                    if not ci.get("resolved", True) and not ci.get("acceptedBySeller", True):
-                        has_action = True
-                        break
-            if has_action:
-                waiting.append(claim)
+    while page < 10:  # max 10 sayfa
+        params = {"status": "WaitingInAction", "size": 50, "page": page}
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get(url, headers=get_trendyol_headers(), params=params)
+            if r.status_code != 200:
+                log.warning(f"İade listesi hatası: {r.status_code} {r.text[:200]}")
+                break
+            data        = r.json()
+            content     = data.get("content", [])
+            total_pages = data.get("totalPages", 1)
+            all_claims.extend(content)
+            if page >= total_pages - 1 or not content:
+                break
+            page += 1
+        except Exception as e:
+            log.error(f"İade fetch hatası: {e}")
+            break
 
-        log.info(f"Toplam iade: {len(content)} | Aksiyon bekleyen: {len(waiting)}")
-        return waiting
-    except Exception as e:
-        log.error(f"İade fetch hatası: {e}")
-        return []
+    # resolved=false olan aksiyon bekleyenleri filtrele
+    waiting = []
+    for claim in all_claims:
+        # Son 30 günün iadelerini al
+        claim_date = claim.get("claimDate", 0)
+        if claim_date and claim_date < since_ms:
+            continue
+        has_action = False
+        for item_group in claim.get("items", []):
+            for ci in item_group.get("claimItems", []):
+                if not ci.get("resolved", True) and not ci.get("acceptedBySeller", True):
+                    has_action = True
+                    break
+        if has_action:
+            waiting.append(claim)
+
+    log.info(f"Toplam iade: {len(all_claims)} | Aksiyon bekleyen: {len(waiting)}")
+    return waiting
 
 
 async def approve_claim(claim_id: str, line_item_ids: list) -> bool:
