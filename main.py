@@ -223,7 +223,7 @@ def is_excel_request(text: str) -> bool:
 # ─── Sosyal Medya İstatistikleri ─────────────────────────────────────────────
 
 async def get_instagram_insights(days: int = 1) -> dict:
-    """Instagram istatistiklerini çeker — son N günün medyalarından toplar."""
+    """Instagram istatistiklerini çeker — medya alanlarından okur."""
     since_ts = int((datetime.now() - timedelta(days=days)).timestamp())
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -234,11 +234,11 @@ async def get_instagram_insights(days: int = 1) -> dict:
             )
             account = r.json()
 
-            # Son N gündeki medyaları çek
+            # Son N gündeki medyaları çek — like/comment/view direkt alanlardan
             r = await client.get(
                 f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
                 params={
-                    "fields": "id,timestamp,media_type",
+                    "fields": "id,timestamp,media_type,like_count,comments_count,video_view_count",
                     "since":  since_ts,
                     "limit":  50,
                     "access_token": META_ACCESS_TOKEN,
@@ -246,52 +246,25 @@ async def get_instagram_insights(days: int = 1) -> dict:
             )
             media_list = r.json().get("data", [])
 
-            # Her medyanın insights'ını topla
             total_impressions = 0
-            total_reach       = 0
             total_likes       = 0
             total_comments    = 0
 
             for media in media_list:
-                media_id   = media.get("id")
-                media_type = media.get("media_type", "")
-                if not media_id:
-                    continue
-                # Reels için farklı metrikler kullan
-                if media_type == "VIDEO":
-                    metrics = "plays,reach,likes,comments,shares"
-                else:
-                    metrics = "impressions,reach,likes,comments"
-                r2 = await client.get(
-                    f"{GRAPH_BASE}/{media_id}/insights",
-                    params={"metric": metrics, "access_token": META_ACCESS_TOKEN},
-                )
-                if r2.status_code != 200:
-                    # Fallback: temel metrikler dene
-                    r2 = await client.get(
-                        f"{GRAPH_BASE}/{media_id}/insights",
-                        params={"metric": "impressions,reach", "access_token": META_ACCESS_TOKEN},
-                    )
-                for item in r2.json().get("data", []):
-                    name  = item.get("name", "")
-                    value = item.get("values", [{}])[0].get("value", 0) if item.get("values") else item.get("value", 0)
-                    if name in ("impressions", "plays"):
-                        total_impressions += value
-                    elif name == "reach":
-                        total_reach += value
-                    elif name == "likes":
-                        total_likes += value
-                    elif name == "comments":
-                        total_comments += value
+                total_likes    += media.get("like_count", 0) or 0
+                total_comments += media.get("comments_count", 0) or 0
+                # Video view count reels/video için
+                views = media.get("video_view_count", 0) or 0
+                total_impressions += views
 
         return {
-            "followers":     account.get("followers_count", "—"),
-            "media_count":   account.get("media_count", "—"),
-            "impressions":   total_impressions,
-            "reach":         total_reach,
-            "likes":         total_likes,
-            "comments":      total_comments,
-            "post_count":    len(media_list),
+            "followers":    account.get("followers_count", "—"),
+            "media_count":  account.get("media_count", "—"),
+            "impressions":  total_impressions,
+            "reach":        0,
+            "likes":        total_likes,
+            "comments":     total_comments,
+            "post_count":   len(media_list),
         }
     except Exception as e:
         log.error(f"Instagram insights hatası: {e}")
@@ -299,10 +272,7 @@ async def get_instagram_insights(days: int = 1) -> dict:
 
 
 async def get_facebook_insights(days: int = 1) -> dict:
-    """Facebook sayfa istatistiklerini çeker — son N günün toplamı."""
-    since = int((datetime.now() - timedelta(days=days)).timestamp())
-    until = int(datetime.now().timestamp())
-    metrics = "page_impressions,page_reach,page_post_engagements,page_views_total"
+    """Facebook sayfa istatistiklerini çeker."""
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(
@@ -311,17 +281,31 @@ async def get_facebook_insights(days: int = 1) -> dict:
             )
             page = r.json()
 
+            # period=total_over_range ile since/until kullan
+            since = int((datetime.now() - timedelta(days=days)).timestamp())
+            until = int(datetime.now().timestamp())
             r = await client.get(
                 f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/insights",
                 params={
-                    "metric":  metrics,
-                    "period":  "day",
+                    "metric":  "page_impressions,page_reach,page_post_engagements,page_views_total",
+                    "period":  "total_over_range",
                     "since":   since,
                     "until":   until,
                     "access_token": FACEBOOK_ACCESS_TOKEN,
                 },
             )
             insights_data = r.json().get("data", [])
+            if not insights_data:
+                # Fallback: lifetime period
+                r = await client.get(
+                    f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/insights",
+                    params={
+                        "metric":  "page_fans,page_impressions,page_post_engagements",
+                        "period":  "day",
+                        "access_token": FACEBOOK_ACCESS_TOKEN,
+                    },
+                )
+                insights_data = r.json().get("data", [])
 
         result = {
             "fan_count":             page.get("fan_count", "—"),
@@ -334,7 +318,11 @@ async def get_facebook_insights(days: int = 1) -> dict:
         for item in insights_data:
             name = item.get("name", "")
             if name in result:
-                total = sum(v.get("value", 0) for v in item.get("values", []))
+                val = item.get("values", [])
+                if val:
+                    total = sum(v.get("value", 0) for v in val)
+                else:
+                    total = item.get("value", 0)
                 result[name] = total
 
         return result
@@ -1376,7 +1364,6 @@ async def handle_message(chat_id: int, text: str) -> None:
             await send_telegram(chat_id, "⏳ Bildirimler çekiliyor...")
             # Yeni siparişler (son 30 dk)
             new_orders    = await fetch_new_orders()
-            claims = []
             # Bekleyen sorular
             questions     = await fetch_pending_questions()
 
@@ -1386,19 +1373,12 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 🛍 Yeni Sipariş (son 30 dk): {len(new_orders)} adet
 ❓ Cevap Bekleyen Soru: {len(questions)} adet"""
 
-            if claims:
-                msg += "\n\n💡 İadeleri görmek için: *trendyol iadeleri göster*"
             if questions:
                 msg += "\n💡 Soruları görmek için: *bekleyen sorular*"
 
             await send_telegram(chat_id, msg)
             return
 
-        if is_pending_claims_request(text):
-            await send_telegram(chat_id, "⏳ İadeler çekiliyor...")
-            claims = await fetch_pending_claims()
-            await send_telegram(chat_id, format_claims_message(claims))
-            return
 
         if is_pending_questions_request(text):
             await send_telegram(chat_id, "⏳ Sorular çekiliyor...")
@@ -1414,32 +1394,6 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
                 lines.append(f"🔸 *{str(product)[:40]}*\n   {str(q_text)[:100]}\n   ID: `{q_id}`")
             lines.append("\n💡 Cevap için: *cevap: ID: Cevabınız*")
             await send_telegram(chat_id, "\n".join(lines))
-            return
-
-        if is_approve_claims_request(text):
-            await send_telegram(chat_id, "⏳ İadeler onaylanıyor...")
-            claims = await fetch_pending_claims()
-            if not claims:
-                await send_telegram(chat_id, "✅ Onaylanacak iade bulunmuyor.")
-                return
-            success = 0
-            fail    = 0
-            for claim in claims:
-                claim_id = str(claim.get("id") or claim.get("claimId", ""))
-                line_ids = []
-                for item_group in claim.get("items", []):
-                    for ci in item_group.get("claimItems", []):
-                        if not ci.get("resolved", True) and not ci.get("acceptedBySeller", True):
-                            cid = ci.get("id")
-                            if cid:
-                                line_ids.append(cid)
-                if claim_id and line_ids:
-                    ok = await approve_claim(claim_id, line_ids)
-                    if ok:
-                        success += 1
-                    else:
-                        fail += 1
-            await send_telegram(chat_id, f"✅ *İade Onaylama Tamamlandı*\n\n• Onaylanan: {success}\n• Hatalı: {fail}")
             return
 
         if is_new_products_request(text):
