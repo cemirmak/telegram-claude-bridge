@@ -1127,12 +1127,13 @@ async def facebook_reels_post(video_url: str, caption: str) -> dict:
             log.info("Video yüklendi, yayınlanıyor...")
 
             # 4) Finish — yayınla
+            short_caption = caption[:200] if len(caption) > 200 else caption
             r = await client.post(
                 f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
                 params={
                     "upload_phase":  "finish",
                     "video_id":      video_id,
-                    "description":   caption,
+                    "description":   short_caption,
                     "video_state":   "PUBLISHED",
                     "access_token":  FACEBOOK_ACCESS_TOKEN,
                 },
