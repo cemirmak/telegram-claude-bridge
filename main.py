@@ -4,8 +4,9 @@ Render.com'da çalışır (FastAPI + httpx + APScheduler)
 
 Zamanlama (TR saati):
   Her 5 dakika               → Trendyol yeni sipariş kontrolü + tedarikçi bildirimi
-  09:00, 12:00, 16:00, 21:00 → Carousel post (Instagram + Facebook)
-  10:30, 19:00               → Reels (Instagram + Facebook)
+  Her 2 dakika               → Meta yorum thread sessizlik kontrolü
+  09:00, 12:00, 15:00, 21:00 → Carousel post (Instagram + Facebook)
+  10:30, 16:00, 20:00        → Reels (Instagram + Facebook)
   14:00, 23:00               → Story (Instagram + Facebook)
 """
 
@@ -19,7 +20,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 # ─── Yapılandırma ───────────────────────────────────────────────────────────
 CLAUDE_API_KEY        = os.environ["CLAUDE_API_KEY"]
@@ -33,6 +34,7 @@ INSTAGRAM_ACCOUNT_ID  = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
 FACEBOOK_PAGE_ID      = os.environ.get("FACEBOOK_PAGE_ID", "")
 IMGBB_API_KEY         = os.environ.get("IMGBB_API_KEY", "")
 TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")
+META_VERIFY_TOKEN     = os.environ.get("META_VERIFY_TOKEN", "redzarram2026")
 
 # Trendyol
 TRENDYOL_API_KEY     = os.environ.get("TRENDYOL_API_KEY", "")
@@ -83,6 +85,13 @@ SUPPLIER_DATA: list        = []
 BARCODE_SUPPLIER_MAP: dict = {}
 BARCODE_IMAGE_MAP: dict    = {}
 CHAT_SUPPLIER_MAP: dict    = {}
+
+# ─── Meta DM + Yorum takibi ─────────────────────────────────────────────────
+# {platform_senderid: [{"role": "user"/"assistant", "text": "..."}]}
+_dm_contexts: dict = {}
+
+# {"ig_postid" veya "fb_postid": {"platform", "post_id", "comments": [...], "last_time", "summary_sent"}}
+_comment_threads: dict = {}
 
 # ─── Tedarikçi ve görsel verisi ──────────────────────────────────────────────
 
@@ -223,18 +232,15 @@ def is_excel_request(text: str) -> bool:
 # ─── Sosyal Medya İstatistikleri ─────────────────────────────────────────────
 
 async def get_instagram_insights(days: int = 1) -> dict:
-    """Instagram istatistiklerini çeker — medya alanlarından okur."""
     since_ts = int((datetime.now() - timedelta(days=days)).timestamp())
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            # Hesap bilgileri
             r = await client.get(
                 f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}",
                 params={"fields": "followers_count,media_count", "access_token": META_ACCESS_TOKEN},
             )
             account = r.json()
 
-            # Son N gündeki medyaları çek — like/comment/view direkt alanlardan
             r = await client.get(
                 f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media",
                 params={
@@ -254,19 +260,18 @@ async def get_instagram_insights(days: int = 1) -> dict:
                 lk = media.get("like_count", 0) or 0
                 cm = media.get("comments_count", 0) or 0
                 vw = media.get("video_view_count", 0) or 0
-                log.info(f"Medya {media.get('media_type')} like:{lk} yorum:{cm} view:{vw} keys:{list(media.keys())}")
                 total_likes       += lk
                 total_comments    += cm
                 total_impressions += vw
 
         return {
-            "followers":    account.get("followers_count", "—"),
-            "media_count":  account.get("media_count", "—"),
-            "impressions":  total_impressions,
-            "reach":        0,
-            "likes":        total_likes,
-            "comments":     total_comments,
-            "post_count":   len(media_list),
+            "followers":   account.get("followers_count", "—"),
+            "media_count": account.get("media_count", "—"),
+            "impressions": total_impressions,
+            "reach":       0,
+            "likes":       total_likes,
+            "comments":    total_comments,
+            "post_count":  len(media_list),
         }
     except Exception as e:
         log.error(f"Instagram insights hatası: {e}")
@@ -274,7 +279,6 @@ async def get_instagram_insights(days: int = 1) -> dict:
 
 
 async def get_facebook_insights(days: int = 1) -> dict:
-    """Facebook sayfa istatistiklerini çeker."""
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(
@@ -283,7 +287,6 @@ async def get_facebook_insights(days: int = 1) -> dict:
             )
             page = r.json()
 
-            # period=total_over_range ile since/until kullan
             since = int((datetime.now() - timedelta(days=days)).timestamp())
             until = int(datetime.now().timestamp())
             r = await client.get(
@@ -298,7 +301,6 @@ async def get_facebook_insights(days: int = 1) -> dict:
             )
             insights_data = r.json().get("data", [])
             if not insights_data:
-                # Fallback: lifetime period
                 r = await client.get(
                     f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/insights",
                     params={
@@ -320,11 +322,8 @@ async def get_facebook_insights(days: int = 1) -> dict:
         for item in insights_data:
             name = item.get("name", "")
             if name in result:
-                val = item.get("values", [])
-                if val:
-                    total = sum(v.get("value", 0) for v in val)
-                else:
-                    total = item.get("value", 0)
+                val   = item.get("values", [])
+                total = sum(v.get("value", 0) for v in val) if val else item.get("value", 0)
                 result[name] = total
 
         return result
@@ -334,7 +333,6 @@ async def get_facebook_insights(days: int = 1) -> dict:
 
 
 async def get_combined_insights(days: int = 1) -> str:
-    """Instagram + Facebook istatistiklerini tek mesajda döndürür."""
     if days == 1:
         label = "Günlük"
     elif days == 7:
@@ -577,25 +575,22 @@ async def fetch_new_orders() -> list:
         return []
 
 
-
-# ─── Trendyol İade İşlemleri ─────────────────────────────────────────────────
-
 def calculate_profit(total_amount: float, total_orders: int, total_qty: int) -> dict:
-    komisyon    = total_amount * 0.215
-    kargo       = total_orders * 60
-    brut_kar    = total_amount - komisyon - kargo
-    maliyet     = brut_kar * 0.60
+    komisyon     = total_amount * 0.215
+    kargo        = total_orders * 60
+    brut_kar     = total_amount - komisyon - kargo
+    maliyet      = brut_kar * 0.60
     vergisiz_kar = brut_kar - maliyet
-    kdv         = vergisiz_kar * 0.10
-    kalan_kar   = vergisiz_kar - kdv
-    kazanc      = brut_kar - kalan_kar
+    kdv          = vergisiz_kar * 0.10
+    kalan_kar    = vergisiz_kar - kdv
+    kazanc       = brut_kar - kalan_kar
     return {
-        "komisyon":     komisyon,
-        "kargo":        kargo,
-        "brut_kar":     brut_kar,
-        "kdv":          kdv,
-        "kalan_kar":    kalan_kar,
-        "kazanc":       kazanc,
+        "komisyon": komisyon,
+        "kargo":    kargo,
+        "brut_kar": brut_kar,
+        "kdv":      kdv,
+        "kalan_kar": kalan_kar,
+        "kazanc":   kazanc,
     }
 
 # ─── Rapor oluşturma ─────────────────────────────────────────────────────────
@@ -700,7 +695,7 @@ def build_excel(orders: list, days: int, supplier_filter: str = "") -> bytes:
                 "Tedarikçi":   supplier,
             })
 
-    df_orders = pd.DataFrame(rows)
+    df_orders        = pd.DataFrame(rows)
     supplier_summary = pd.DataFrame()
     product_summary  = pd.DataFrame()
 
@@ -839,9 +834,9 @@ Lütfen hazırlayınız ✅"""
         if len(_notified_orders) > 1000:
             _notified_orders = set(list(_notified_orders)[-500:])
 
+
 async def fetch_pending_questions() -> list:
-    """Cevap bekleyen müşteri sorularını çeker."""
-    url = f"{TRENDYOL_BASE}/qna/sellers/{TRENDYOL_SUPPLIER_ID}/questions/filter"
+    url    = f"{TRENDYOL_BASE}/qna/sellers/{TRENDYOL_SUPPLIER_ID}/questions/filter"
     params = {"status": "WAITING_FOR_ANSWER", "size": 50, "page": 0}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -857,7 +852,6 @@ async def fetch_pending_questions() -> list:
 
 
 async def answer_question(question_id: str, answer_text: str) -> bool:
-    """Müşteri sorusunu cevaplar."""
     url = f"{TRENDYOL_BASE}/qna/sellers/{TRENDYOL_SUPPLIER_ID}/questions/{question_id}/answers"
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -877,7 +871,6 @@ async def answer_question(question_id: str, answer_text: str) -> bool:
 
 
 async def check_new_questions():
-    """Her 5 dakikada yeni müşteri sorularını kontrol eder."""
     global _notified_questions
 
     if not TRENDYOL_API_KEY or not TRENDYOL_API_SECRET:
@@ -892,13 +885,13 @@ async def check_new_questions():
         if not q_id or q_id in _notified_questions:
             continue
 
-        product_name = q.get("productName", q.get("product", {}).get("name", "—"))
+        product_name  = q.get("productName", q.get("product", {}).get("name", "—"))
         question_text = q.get("text", q.get("questionText", "—"))
         customer_name = q.get("customerName", q.get("userName", "Müşteri"))
         created_date  = q.get("createdDate", "")
         if created_date:
             try:
-                dt = datetime.fromtimestamp(created_date / 1000)
+                dt           = datetime.fromtimestamp(created_date / 1000)
                 created_date = dt.strftime("%d.%m.%Y %H:%M")
             except Exception:
                 pass
@@ -973,9 +966,6 @@ async def instagram_carousel_post(image_urls: list, caption: str) -> dict:
             params={"creation_id": carousel["id"], "access_token": META_ACCESS_TOKEN},
         )
         result = r.json()
-        if r.status_code not in (200, 201):
-            log.error(f"Carousel publish hatası: {r.status_code} {r.text}")
-        # 403 gelse bile yayınlanmış olabiliyor
         if "id" in result or r.status_code in (200, 201):
             return {"id": result.get("id", "ok")}
         return result
@@ -989,16 +979,12 @@ async def instagram_reels_post(video_url: str, caption: str) -> dict:
                     "caption": caption, "access_token": META_ACCESS_TOKEN},
         )
         if r.status_code != 200:
-            log.error(f"Instagram Reels container hatası: {r.status_code} {r.text}")
             return {"error": r.text}
         data = r.json()
         if "id" not in data:
             return {"error": str(data)}
 
         creation_id = data["id"]
-        log.info(f"Instagram Reels container oluşturuldu: {creation_id}")
-
-        # Video işlenene kadar bekle (max 90 saniye)
         for attempt in range(18):
             await asyncio.sleep(5)
             r = await client.get(
@@ -1016,8 +1002,6 @@ async def instagram_reels_post(video_url: str, caption: str) -> dict:
             f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/media_publish",
             params={"creation_id": creation_id, "access_token": META_ACCESS_TOKEN},
         )
-        if r.status_code != 200:
-            log.error(f"Instagram Reels publish hatası: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -1066,83 +1050,57 @@ async def facebook_carousel_post(image_urls: list, caption: str) -> dict:
 
 
 async def facebook_reels_post(video_url: str, caption: str) -> dict:
-    """
-    Facebook Reels binary upload:
-    1. Videoyu indir
-    2. Upload session aç
-    3. Binary olarak yükle
-    4. Yayınla
-    """
     try:
-        # 1) Videoyu indir
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.get(video_url, follow_redirects=True)
             if r.status_code != 200:
-                log.error(f"Video indirilemedi: {r.status_code}")
                 return {"error": f"Video indirilemedi: {r.status_code}"}
             video_bytes = r.content
             file_size   = len(video_bytes)
             log.info(f"Video indirildi: {file_size / 1024 / 1024:.1f} MB")
 
         async with httpx.AsyncClient(timeout=120) as client:
-            # 2) Upload session başlat
             r = await client.post(
                 f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
-                params={
-                    "upload_phase": "start",
-                    "access_token": FACEBOOK_ACCESS_TOKEN,
-                },
+                params={"upload_phase": "start", "access_token": FACEBOOK_ACCESS_TOKEN},
             )
             if r.status_code != 200:
-                log.error(f"Facebook Reels start hatası: {r.status_code} {r.text}")
                 return {"error": r.text}
 
-            data     = r.json()
-            video_id = data.get("video_id")
+            data       = r.json()
+            video_id   = data.get("video_id")
             upload_url = data.get("upload_url", "")
 
             if not video_id:
                 return {"error": str(data)}
 
-            log.info(f"Facebook Reels video_id: {video_id}")
-
-            # 3) Binary upload — rupload.facebook.com
             upload_endpoint = upload_url if upload_url else f"https://rupload.facebook.com/video-upload/v19.0/{video_id}"
             r = await client.post(
                 upload_endpoint,
                 content=video_bytes,
                 headers={
                     "Authorization": f"OAuth {FACEBOOK_ACCESS_TOKEN}",
-                    "Content-Type": "video/mp4",
+                    "Content-Type":  "video/mp4",
                     "Content-Length": str(file_size),
-                    "offset": "0",
-                    "file_size": str(file_size),
+                    "offset":         "0",
+                    "file_size":      str(file_size),
                 },
             )
-
             if r.status_code not in (200, 201):
-                log.error(f"Facebook Reels upload hatası: {r.status_code} {r.text}")
                 return {"error": r.text}
 
-            log.info("Video yüklendi, yayınlanıyor...")
-
-            # 4) Finish — yayınla
             short_caption = caption[:200] if len(caption) > 200 else caption
             r = await client.post(
                 f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/video_reels",
                 params={
-                    "upload_phase":  "finish",
-                    "video_id":      video_id,
-                    "description":   short_caption,
-                    "video_state":   "PUBLISHED",
-                    "access_token":  FACEBOOK_ACCESS_TOKEN,
+                    "upload_phase": "finish",
+                    "video_id":     video_id,
+                    "description":  short_caption,
+                    "video_state":  "PUBLISHED",
+                    "access_token": FACEBOOK_ACCESS_TOKEN,
                 },
             )
-            if r.status_code != 200:
-                log.error(f"Facebook Reels finish hatası: {r.status_code} {r.text}")
-            result = r.json()
-            log.info(f"Facebook Reels yayınlandı: {result}")
-            return result
+            return r.json()
 
     except Exception as e:
         log.error(f"Facebook Reels exception: {e}")
@@ -1182,13 +1140,13 @@ def pick_product(df: pd.DataFrame, require_video: bool = False) -> dict:
 
     today = datetime.now().strftime("%Y-%m-%d")
     if _posted_date != today:
-        _posted_date = today
+        _posted_date  = today
         _posted_today = set()
 
     available = df[~df["Model Kodu"].isin(_posted_today)]
     if available.empty:
         _posted_today = set()
-        available = df
+        available     = df
 
     if require_video and "Video URL" in df.columns:
         with_video = available[
@@ -1202,7 +1160,7 @@ def pick_product(df: pd.DataFrame, require_video: bool = False) -> dict:
     _posted_today.add(row["Model Kodu"])
 
     gorsel_cols = [f"Görsel {i}" for i in range(1, 9)]
-    image_urls = [
+    image_urls  = [
         row[c] for c in gorsel_cols
         if pd.notna(row.get(c)) and str(row.get(c)).startswith("http")
     ]
@@ -1253,6 +1211,319 @@ Sadece caption metnini döndür."""
 #REDZARRAM #Trendyol #MiniEtek #KotEtek #Moda #Fashion #TürkModa #Style #Outfit #OOTD #GünlükKombin #KadınModa #TrendyolModa #Şık #Kombin"""
 
     return caption
+
+# ─── Meta Satış Asistanı ────────────────────────────────────────────────────
+
+def get_products_for_sales_context() -> str:
+    """Excel'den ürün özeti döndürür — Claude satış promptuna eklenir."""
+    try:
+        df        = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
+        fiyat_col = "Trendyol'da Satılacak Fiyat (KDV Dahil)"
+        unique    = df.drop_duplicates(subset=["Model Kodu"])
+        lines     = []
+        for _, row in unique.head(25).iterrows():
+            name  = str(row.get("Ürün Adı", ""))[:55]
+            price = row.get(fiyat_col, "")
+            desc  = str(row.get("Ürün Açıklaması", ""))[:70].replace("\n", " ")
+            link  = row.get("Trendyol.com Linki", "")
+            lines.append(f"• {name} | {price}₺ | {desc} | {link}")
+        return "\n".join(lines)
+    except Exception as e:
+        log.error(f"Sales context hatası: {e}")
+        return "Ürün listesi yüklenemedi."
+
+
+def find_product_by_keyword(text: str) -> dict | None:
+    """Metindeki anahtar kelimelere göre ürün bul, bilgileri döndür."""
+    SATIS_KW = ["fiyat", "beden", "var mı", "nasıl", "göster", "hangi",
+                "etek", "kot", "denim", "ürün", "sipariş", "nereden", "link", "satın"]
+    if not any(kw in text.lower() for kw in SATIS_KW):
+        return None
+    try:
+        df    = pd.read_excel(EXCEL_PATH, sheet_name="Ürünler")
+        words = [w for w in text.lower().split() if len(w) > 3]
+        for _, row in df.iterrows():
+            name = str(row.get("Ürün Adı", "")).lower()
+            if any(w in name for w in words):
+                barkod = str(row.get("Barkod", ""))
+                gorsel = BARCODE_IMAGE_MAP.get(barkod) or str(row.get("Görsel 1", ""))
+                if gorsel and gorsel.startswith("http"):
+                    fiyat_col = "Trendyol'da Satılacak Fiyat (KDV Dahil)"
+                    return {
+                        "name":      row.get("Ürün Adı", ""),
+                        "image_url": gorsel,
+                        "price":     row.get(fiyat_col, ""),
+                        "link":      row.get("Trendyol.com Linki", ""),
+                    }
+    except Exception as e:
+        log.error(f"Ürün arama hatası: {e}")
+    return None
+
+
+async def ask_claude_sales(user_message: str, history: list = None,
+                            platform: str = "Instagram") -> str:
+    """Satış odaklı Claude çağrısı — direkt /v1/messages API kullanır.
+    Managed agent session'ıyla çakışmaz, çok daha hızlıdır (2-3 sn).
+    """
+    product_ctx = get_products_for_sales_context()
+
+    # Konuşma geçmişini messages formatına çevir
+    messages = []
+    if history:
+        for h in history[-6:]:  # Son 6 mesaj (3 tur)
+            role = "user" if h["role"] == "user" else "assistant"
+            messages.append({"role": role, "content": h["text"]})
+
+    # Son kullanıcı mesajını ekle
+    messages.append({"role": "user", "content": user_message})
+
+    system_prompt = f"""Sen REDZARRAM mağazasının {platform} satış asistanısın.
+REDZARRAM, Trendyol'da mini etek ve denim ürünler satan Türk bir moda markasıdır.
+
+GÖREVIN:
+- Müşterilere samimi, sıcak ve ikna edici biçimde cevap ver
+- Ürünlerin kalitesini, şıklığını ve uygun fiyatını özellikle vurgula
+- Fiyat veya ürün sorulursa aşağıdaki listeden bilgi ver ve Trendyol linkini paylaş
+- Kısa ve etkili yaz — {platform} için max 3 cümle yeterli
+- Türkçe yaz, samimi ve genç bir dil kullan, emoji kullanabilirsin
+- Müşteri ilgileniyorsa "hemen sipariş verebilirsiniz" veya "DM atın" gibi harekete geçirici cümle ekle
+- Eğer soru belirsizse ürünleri tanıt ve merak uyandır
+- SADECE cevap metnini yaz, başka hiçbir şey ekleme
+
+MEVCUT ÜRÜNLER:
+{product_ctx}"""
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key":         CLAUDE_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type":      "application/json",
+                },
+                json={
+                    "model":      "claude-sonnet-4-5",
+                    "max_tokens": 350,
+                    "system":     system_prompt,
+                    "messages":   messages,
+                },
+            )
+        if r.status_code != 200:
+            log.error(f"Satış Claude API hatası: {r.status_code} {r.text[:200]}")
+            return ""
+        return r.json()["content"][0]["text"].strip()
+    except Exception as e:
+        log.error(f"Satış Claude exception: {e}")
+        return ""
+
+
+# ─── Meta DM Gönderme ────────────────────────────────────────────────────────
+
+async def send_meta_dm(platform: str, recipient_id: str, text: str) -> bool:
+    """Instagram veya Facebook'ta DM gönderir."""
+    try:
+        if platform == "instagram":
+            url   = f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/messages"
+            token = META_ACCESS_TOKEN
+        else:
+            url   = f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/messages"
+            token = FACEBOOK_ACCESS_TOKEN
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                url,
+                params={"access_token": token},
+                json={"recipient": {"id": recipient_id}, "message": {"text": text[:1000]}},
+            )
+        if r.status_code not in (200, 201):
+            log.error(f"Meta DM hatası ({platform}): {r.status_code} {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        log.error(f"Meta DM exception: {e}")
+        return False
+
+
+async def send_meta_dm_with_image(platform: str, recipient_id: str,
+                                   text: str, image_url: str) -> bool:
+    """Önce ürün görseli, ardından metin DM gönderir."""
+    try:
+        if platform == "instagram":
+            url   = f"{GRAPH_BASE}/{INSTAGRAM_ACCOUNT_ID}/messages"
+            token = META_ACCESS_TOKEN
+        else:
+            url   = f"{GRAPH_BASE}/{FACEBOOK_PAGE_ID}/messages"
+            token = FACEBOOK_ACCESS_TOKEN
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            imgbb_url = await upload_to_imgbb(image_url)
+            if imgbb_url:
+                await client.post(
+                    url,
+                    params={"access_token": token},
+                    json={
+                        "recipient": {"id": recipient_id},
+                        "message":   {
+                            "attachment": {
+                                "type":    "image",
+                                "payload": {"url": imgbb_url, "is_reusable": True},
+                            }
+                        },
+                    },
+                )
+                await asyncio.sleep(1)
+
+            r = await client.post(
+                url,
+                params={"access_token": token},
+                json={"recipient": {"id": recipient_id}, "message": {"text": text[:1000]}},
+            )
+        return r.status_code in (200, 201)
+    except Exception as e:
+        log.error(f"Meta DM+görsel exception: {e}")
+        return False
+
+
+# ─── Meta Yorum Cevaplama ────────────────────────────────────────────────────
+
+async def reply_to_meta_comment(platform: str, comment_id: str, text: str) -> bool:
+    """Instagram veya Facebook yorumuna public cevap yazar."""
+    try:
+        if platform == "instagram":
+            url   = f"{GRAPH_BASE}/{comment_id}/replies"
+            token = META_ACCESS_TOKEN
+        else:
+            url   = f"{GRAPH_BASE}/{comment_id}/comments"
+            token = FACEBOOK_ACCESS_TOKEN
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, params={"message": text[:500], "access_token": token})
+
+        if r.status_code not in (200, 201):
+            log.error(f"Yorum cevaplama hatası ({platform}): {r.status_code} {r.text[:200]}")
+            return False
+        log.info(f"Yorum cevaplandı ({platform}): {comment_id}")
+        return True
+    except Exception as e:
+        log.error(f"Yorum cevaplama exception: {e}")
+        return False
+
+
+# ─── Meta DM Handler ─────────────────────────────────────────────────────────
+
+async def handle_meta_dm(platform: str, sender_id: str,
+                          sender_name: str, message_text: str):
+    """Gelen DM'i Claude'a iletir, cevap gönderir, gerekirse görsel ekler."""
+    if not message_text.strip():
+        return
+
+    ctx_key = f"{platform}_{sender_id}"
+    history = _dm_contexts.get(ctx_key, [])
+
+    log.info(f"Meta DM ({platform}) ← {sender_name}: {message_text[:80]}")
+
+    reply = await ask_claude_sales(message_text, history, platform.capitalize())
+
+    # Hata cevabı gelirse fallback
+    if any(x in reply for x in ["❌", "⏱", "🤔", "Agent hatası"]):
+        reply = ("Merhaba! 😊 Ürünlerimiz hakkında her türlü soruyu Trendyol mağazamızdan "
+                 "inceleyebilirsiniz. Yardımcı olmaktan mutluluk duyarız! 🛍️")
+
+    # Konuşma geçmişini güncelle (son 10 mesaj)
+    history.append({"role": "user",      "text": message_text})
+    history.append({"role": "assistant", "text": reply})
+    _dm_contexts[ctx_key] = history[-10:]
+
+    # Ürün görseli ekle?
+    product = find_product_by_keyword(message_text)
+    if product:
+        await send_meta_dm_with_image(platform, sender_id, reply, product["image_url"])
+    else:
+        await send_meta_dm(platform, sender_id, reply)
+
+    log.info(f"Meta DM ({platform}) → {sender_name}: {reply[:80]}")
+
+
+# ─── Meta Yorum Handler ──────────────────────────────────────────────────────
+
+async def handle_meta_comment(platform: str, post_id: str, comment_id: str,
+                               commenter_id: str, commenter_name: str, comment_text: str):
+    """Gelen yorumu Claude'a iletir, yorum altına cevap yazar, thread takibi yapar."""
+    if not comment_text.strip():
+        return
+
+    thread_key = f"{platform}_{post_id}"
+    now        = datetime.now()
+
+    log.info(f"Meta Yorum ({platform}) ← {commenter_name}: {comment_text[:80]}")
+
+    # Thread oluştur veya güncelle
+    if thread_key not in _comment_threads:
+        _comment_threads[thread_key] = {
+            "platform":     platform,
+            "post_id":      post_id,
+            "comments":     [],
+            "last_time":    now,
+            "summary_sent": False,
+        }
+
+    thread                  = _comment_threads[thread_key]
+    thread["last_time"]     = now
+    thread["summary_sent"]  = False  # Yeni yorum geldi → özet sıfırla
+
+    # Claude'dan yorum cevabı al
+    prompt = (f"'{commenter_name}' adlı bir kullanıcı REDZARRAM'ın "
+              f"{platform.capitalize()} paylaşımına şu yorumu yazdı: '{comment_text}'. "
+              f"Kısa, samimi, satışa yönlendirici bir yorum cevabı yaz. "
+              f"Gerekirse Trendyol'dan sipariş vermelerini öner.")
+
+    reply = await ask_claude_sales(prompt, platform=platform.capitalize())
+
+    if any(x in reply for x in ["❌", "⏱", "🤔", "Agent hatası"]):
+        reply = "Teşekkürler! 😊 Trendyol mağazamızdan inceleyebilir, DM atabilirsiniz! 💜"
+
+    # Yorum kaydına ekle
+    thread["comments"].append({
+        "commenter": commenter_name,
+        "text":      comment_text,
+        "time":      now.strftime("%H:%M"),
+        "reply":     reply,
+    })
+
+    # Yoruma cevap yaz
+    await reply_to_meta_comment(platform, comment_id, reply)
+    log.info(f"Meta Yorum ({platform}) → {commenter_name}: {reply[:80]}")
+
+
+# ─── Thread sessizlik kontrolü (her 2 dk) ────────────────────────────────────
+
+async def check_silent_comment_threads():
+    """7+ dakikadır yeni yorum gelmeyen thread'leri özetleyip Telegram'a gönderir."""
+    now = datetime.now()
+    for thread_key, thread in list(_comment_threads.items()):
+        if thread["summary_sent"] or not thread["comments"]:
+            continue
+
+        elapsed = (now - thread["last_time"]).total_seconds()
+        if elapsed < 420:  # 7 dakika
+            continue
+
+        platform = thread["platform"].capitalize()
+        post_id  = thread["post_id"]
+        comments = thread["comments"]
+
+        lines = [f"💬 *{platform} Yorum Özeti*",
+                 f"📌 Post: `{post_id}` | {len(comments)} yorum\n"]
+
+        for c in comments[-10:]:
+            lines.append(f"👤 *{c['commenter']}* ({c['time']}): {c['text'][:70]}")
+            if c.get("reply"):
+                lines.append(f"   ↳ 🤖 {c['reply'][:70]}")
+
+        await notify_telegram("\n".join(lines))
+        thread["summary_sent"] = True
+        log.info(f"Thread özeti gönderildi: {thread_key} ({len(comments)} yorum)")
 
 # ─── Zamanlanmış görevler ───────────────────────────────────────────────────
 
@@ -1371,10 +1642,8 @@ async def handle_message(chat_id: int, text: str) -> None:
 
         if is_dashboard_request(text):
             await send_telegram(chat_id, "⏳ Bildirimler çekiliyor...")
-            # Yeni siparişler (son 30 dk)
-            new_orders    = await fetch_new_orders()
-            # Bekleyen sorular
-            questions     = await fetch_pending_questions()
+            new_orders = await fetch_new_orders()
+            questions  = await fetch_pending_questions()
 
             msg = f"""📋 *Trendyol Genel Durum*
 _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
@@ -1384,10 +1653,8 @@ _{datetime.now().strftime('%d.%m.%Y %H:%M')}_
 
             if questions:
                 msg += "\n💡 Soruları görmek için: *bekleyen sorular*"
-
             await send_telegram(chat_id, msg)
             return
-
 
         if is_pending_questions_request(text):
             await send_telegram(chat_id, "⏳ Sorular çekiliyor...")
@@ -1441,7 +1708,6 @@ scheduler = AsyncIOScheduler(timezone="Europe/Istanbul")
 async def lifespan(app: FastAPI):
     load_supplier_data()
 
-    # Admin chat ID'leri doldur
     global ADMIN_CHAT_IDS
     ADMIN_CHAT_IDS = {
         int(os.environ.get("TELEGRAM_CHAT_ID", "0")),
@@ -1451,7 +1717,6 @@ async def lifespan(app: FastAPI):
     ADMIN_CHAT_IDS.discard(0)
     log.info(f"Admin chat ID'leri: {ADMIN_CHAT_IDS}")
 
-    # Mevcut soruları başlangıçta yükle — bildirim flood'unu önle
     try:
         existing_questions = await fetch_pending_questions()
         for q in existing_questions:
@@ -1460,7 +1725,7 @@ async def lifespan(app: FastAPI):
                 _notified_questions.add(qid)
         log.info(f"Mevcut {len(_notified_questions)} soru bildirim listesine eklendi")
     except Exception as e:
-        log.error(f"Mevcut iade/soru yükleme hatası: {e}")
+        log.error(f"Mevcut soru yükleme hatası: {e}")
 
     try:
         sid = await get_or_create_session()
@@ -1468,20 +1733,22 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.error(f"Session başlatılamadı: {exc}")
 
-    scheduler.add_job(scheduled_carousel, CronTrigger(hour=9,  minute=0))
-    scheduler.add_job(scheduled_carousel, CronTrigger(hour=12, minute=0))
-    scheduler.add_job(scheduled_carousel, CronTrigger(hour=15, minute=0))
-    scheduler.add_job(scheduled_carousel, CronTrigger(hour=21, minute=0))
-    scheduler.add_job(scheduled_reels,    CronTrigger(hour=10, minute=30))
-    scheduler.add_job(scheduled_reels,    CronTrigger(hour=16, minute=0))
-    scheduler.add_job(scheduled_reels,    CronTrigger(hour=20, minute=0))
-    scheduler.add_job(scheduled_story,    CronTrigger(hour=14, minute=0))
-    scheduler.add_job(scheduled_story,    CronTrigger(hour=23, minute=0))
-    scheduler.add_job(check_new_orders,   IntervalTrigger(minutes=5))
-    scheduler.add_job(check_new_questions,  IntervalTrigger(minutes=5))
+    # Zamanlanmış görevler
+    scheduler.add_job(scheduled_carousel,           CronTrigger(hour=9,  minute=0))
+    scheduler.add_job(scheduled_carousel,           CronTrigger(hour=12, minute=0))
+    scheduler.add_job(scheduled_carousel,           CronTrigger(hour=15, minute=0))
+    scheduler.add_job(scheduled_carousel,           CronTrigger(hour=21, minute=0))
+    scheduler.add_job(scheduled_reels,              CronTrigger(hour=10, minute=30))
+    scheduler.add_job(scheduled_reels,              CronTrigger(hour=16, minute=0))
+    scheduler.add_job(scheduled_reels,              CronTrigger(hour=20, minute=0))
+    scheduler.add_job(scheduled_story,              CronTrigger(hour=14, minute=0))
+    scheduler.add_job(scheduled_story,              CronTrigger(hour=23, minute=0))
+    scheduler.add_job(check_new_orders,             IntervalTrigger(minutes=5))
+    scheduler.add_job(check_new_questions,          IntervalTrigger(minutes=5))
+    scheduler.add_job(check_silent_comment_threads, IntervalTrigger(minutes=2))  # YENİ
 
     scheduler.start()
-    log.info("⏰ Carousel 09:00/12:00/15:00/21:00 | Reels 10:30/16:00/20:00 | Story 14:00/23:00 | Sipariş+Soru her 5dk (TR)")
+    log.info("⏰ Scheduler başladı | Meta webhook aktif")
 
     yield
     scheduler.shutdown()
@@ -1489,6 +1756,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+# ─── Telegram Webhook ────────────────────────────────────────────────────────
 
 @app.post("/webhook")
 async def webhook(request: Request, background: BackgroundTasks):
@@ -1537,6 +1806,105 @@ async def webhook(request: Request, background: BackgroundTasks):
     await send_telegram(chat_id, "⏳ Cevap yazılıyor…")
     return JSONResponse({"ok": True})
 
+
+# ─── Meta Webhook ────────────────────────────────────────────────────────────
+
+@app.get("/meta_webhook")
+async def meta_webhook_verify(request: Request):
+    """Meta'nın webhook doğrulama isteğini karşılar (GET)."""
+    params    = dict(request.query_params)
+    mode      = params.get("hub.mode")
+    challenge = params.get("hub.challenge")
+    token     = params.get("hub.verify_token")
+
+    if mode == "subscribe" and token == META_VERIFY_TOKEN:
+        log.info("✅ Meta webhook doğrulandı")
+        return PlainTextResponse(challenge or "ok")
+
+    log.warning(f"Meta webhook doğrulama başarısız | token={token}")
+    return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+
+@app.post("/meta_webhook")
+async def meta_webhook_handler(request: Request, background: BackgroundTasks):
+    """Meta'dan gelen DM ve yorum eventlerini işler (POST)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": True})
+
+    obj = body.get("object", "")
+
+    if obj == "instagram":
+        platform = "instagram"
+    elif obj == "page":
+        platform = "facebook"
+    else:
+        return JSONResponse({"ok": True})
+
+    for entry in body.get("entry", []):
+
+        # ── DM (messaging) ──────────────────────────────────────────────────
+        for msg_event in entry.get("messaging", []):
+            sender_id   = msg_event.get("sender",    {}).get("id", "")
+            recipient_id = msg_event.get("recipient", {}).get("id", "")
+            message     = msg_event.get("message",   {})
+            msg_text    = message.get("text", "").strip()
+
+            # Kendi mesajlarımızı yoksay
+            own_id = INSTAGRAM_ACCOUNT_ID if platform == "instagram" else FACEBOOK_PAGE_ID
+            if sender_id == own_id or not msg_text or message.get("is_echo"):
+                continue
+
+            sender_name = msg_event.get("sender", {}).get("name", "Kullanıcı")
+            background.add_task(handle_meta_dm, platform, sender_id, sender_name, msg_text)
+
+        # ── Yorumlar (changes) ───────────────────────────────────────────────
+        for change in entry.get("changes", []):
+            field = change.get("field", "")
+            value = change.get("value", {})
+
+            # Instagram yorumu
+            if field == "comments" and platform == "instagram":
+                comment_id     = value.get("id", "")
+                comment_text   = value.get("text", "").strip()
+                commenter      = value.get("from", {})
+                commenter_id   = commenter.get("id", "")
+                commenter_name = commenter.get("username", "Kullanıcı")
+                media_id       = value.get("media", {}).get("id", entry.get("id", ""))
+
+                own_id = INSTAGRAM_ACCOUNT_ID
+                if commenter_id == own_id or not comment_text or not comment_id:
+                    continue
+
+                background.add_task(
+                    handle_meta_comment,
+                    platform, media_id, comment_id,
+                    commenter_id, commenter_name, comment_text,
+                )
+
+            # Facebook yorumu
+            elif field == "feed" and value.get("item") == "comment" and platform == "facebook":
+                comment_id     = value.get("comment_id", "")
+                comment_text   = value.get("message", "").strip()
+                commenter_id   = str(value.get("sender_id", ""))
+                commenter_name = value.get("sender_name", "Kullanıcı")
+                post_id        = value.get("post_id", entry.get("id", ""))
+
+                own_id = FACEBOOK_PAGE_ID
+                if commenter_id == own_id or not comment_text or not comment_id:
+                    continue
+
+                background.add_task(
+                    handle_meta_comment,
+                    platform, post_id, comment_id,
+                    commenter_id, commenter_name, comment_text,
+                )
+
+    return JSONResponse({"ok": True})
+
+
+# ─── Health check ────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def health():
