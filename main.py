@@ -1909,3 +1909,66 @@ async def meta_webhook_handler(request: Request, background: BackgroundTasks):
 @app.get("/")
 async def health():
     return {"status": "ok", "session": _active_session_id}
+
+
+# ─── Privacy Policy ──────────────────────────────────────────────────────────
+
+@app.get("/privacy")
+async def privacy_policy():
+    from fastapi.responses import HTMLResponse
+    html = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>REDZARRAM Gizlilik Politikası</title>
+<style>
+  body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; line-height: 1.8; color: #333; }
+  h1   { color: #111; border-bottom: 2px solid #eee; padding-bottom: 10px; }
+  h2   { color: #444; margin-top: 30px; }
+</style>
+</head>
+<body>
+<h1>REDZARRAM Gizlilik Politikası</h1>
+<p><em>Son güncelleme: Mayıs 2026</em></p>
+
+<h2>1. Genel Bilgi</h2>
+<p>Bu gizlilik politikası, REDZARRAM'ın Instagram ve Facebook platformları üzerinden yürütülen müşteri hizmetleri uygulamasına ilişkin veri işleme pratiklerini açıklamaktadır.</p>
+
+<h2>2. Toplanan Veriler</h2>
+<p>Uygulamamız yalnızca aşağıdaki verileri işler:</p>
+<ul>
+  <li>Instagram ve Facebook kullanıcı adı veya profil ID'si</li>
+  <li>Platformlar üzerinden gönderilen mesaj ve yorum içerikleri</li>
+</ul>
+<p>Bu veriler yalnızca müşteri sorularını yanıtlamak amacıyla kullanılır.</p>
+
+<h2>3. Verilerin Kullanım Amacı</h2>
+<p>Toplanan veriler;</p>
+<ul>
+  <li>Müşteri sorularını yanıtlamak,</li>
+  <li>Ürün bilgisi sağlamak,</li>
+  <li>Mağaza hizmet kalitesini artırmak</li>
+</ul>
+<p>amacıyla kullanılmaktadır. Veriler hiçbir üçüncü tarafla paylaşılmaz veya satılmaz.</p>
+
+<h2>4. Veri Saklama Süresi</h2>
+<p>Mesaj ve yorum verileri en fazla 30 gün süreyle sistemde tutulur, ardından otomatik olarak silinir.</p>
+
+<h2>5. GDPR Hakları</h2>
+<p>Avrupa Birliği'nde ikamet eden kullanıcılar aşağıdaki haklara sahiptir:</p>
+<ul>
+  <li>Verilerine erişim talep etme</li>
+  <li>Verilerinin düzeltilmesini isteme</li>
+  <li>Verilerinin silinmesini talep etme</li>
+</ul>
+<p>Bu hakları kullanmak için aşağıdaki e-posta adresiyle iletişime geçebilirsiniz.</p>
+
+<h2>6. İletişim</h2>
+<p>Gizlilik politikamıza ilişkin sorularınız için:<br>
+<strong>E-posta:</strong> cemikspot@gmail.com</p>
+
+<h2>7. Politika Güncellemeleri</h2>
+<p>Bu politika gerektiğinde güncellenebilir. Güncel versiyon her zaman bu sayfada yayımlanır.</p>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
